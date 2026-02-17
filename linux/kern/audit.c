@@ -2927,7 +2927,6 @@ EXPORT_SYMBOL(audit_log);
 #include <kern/sched_prim.h>
 #include <kern/kern_types.h>
 #include "sched/sched.h"
-
-#endif /* DARLING */
+#include <pexpert/pexpert.h>
 #endif /* KERN_CFS */
 #endif /* CONFIG_AUDIT */
