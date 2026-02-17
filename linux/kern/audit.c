@@ -2928,14 +2928,6 @@ EXPORT_SYMBOL(audit_log);
 #include <kern/kern_types.h>
 #include "sched/sched.h"
 
-#ifndef DARLING
-typedef struct {
-	__u32 osd_type;
-	__u32  osd_size;
-	__u8 *osd_title;
-	void *osd_data;
-	__u32  osd_data_size;
-} *os_state_data_t;
 #endif /* DARLING */
 #endif /* KERN_CFS */
 #endif /* CONFIG_AUDIT */
