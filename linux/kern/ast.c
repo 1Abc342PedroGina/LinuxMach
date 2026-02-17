@@ -24,7 +24,13 @@
  * any improvements or extensions that they make and grant Carnegie Mellon
  * the rights to redistribute these changes.
  */
-
+#include <linux/irq-entry-common.h>
+#include <linux/resume_user_mode.h>
+#include <linux/highmem.h>
+#include <linux/jump_label.h>
+#include <linux/kmsan.h>
+#include <linux/livepatch.h>
+#include <linux/tick.h>
 #include <kern/ast.h>
 #include <kern/counter.h>
 #include <kern/misc_protos.h>
