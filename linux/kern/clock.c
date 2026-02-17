@@ -54,7 +54,20 @@
  *
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/device.h>
+#include <linux/clocksource.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/sched.h> /* for spin_unlock_irq() using preempt_count() m68k */
+#include <linux/tick.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/prandom.h>
+#include <linux/cpu.h>
+
+#include "tick-internal.h"
 #include <mach/mach_types.h>
 
 #include <kern/spl.h>
@@ -78,8 +91,70 @@
 #include <sys/timex.h>
 #include <kern/arithmetic_128.h>
 #include <os/log.h>
+#include <mach/mach_types.h>
+#include <linux/device.h>
+#include <linux/clocksource.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/sched.h> /* for spin_unlock_irq() using preempt_count() m68k */
+#include <linux/tick.h>
+#include <linux/kthread.h>
+#include <linux/prandom.h>
+#include <linux/cpu.h>
+#include <linux/clockchips.h>
+#include <linux/hrtimer.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/smp.h>
+#include <linux/device.h>
+
+#include "tick-internal.h"
+
+
+#include "tick-internal.h"
+#include "timekeeping_internal.h"
+#include <kern/host.h>
+#include <kern/spl.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
+#include <kern/ipc_host.h>
+#include <kern/clock.h>
+#include <kern/zalloc.h>
+
+#include <ipc/ipc_types.h>
+#include <ipc/ipc_port.h>
+
+#include <mach/mach_traps.h>
+#include <mach/mach_time.h>
+
+#include <mach/clock_server.h>
+#include <mach/clock_reply.h>
+
+#include <mach/mach_host_server.h>
+#include <mach/host_priv_server.h>
+#include <libkern/section_keywords.h>
 #include <linux/sched/clock.h>
 #include "sched.h"
+#include <linux/time.h>
+#include <linux/hrtimer.h>
+#include <linux/timerqueue.h>
+#include <linux/rtc.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/debug.h>
+#include <linux/alarmtimer.h>
+#include <linux/mutex.h>
+#include <linux/platform_device.h>
+#include <linux/posix-timers.h>
+#include <linux/workqueue.h>
+#include <linux/freezer.h>
+#include <linux/compat.h>
+#include <linux/module.h>
+#include <linux/time_namespace.h>
+
+#include "posix-timers.h"
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/alarmtimer.h>
 #if HIBERNATION && HAS_CONTINUOUS_HWCLOCK
 // On ARM64, the hwclock keeps ticking across a normal S2R so we use it to reset the
 // system clock after a normal wake. However, on hibernation we cut power to the hwclock,
@@ -2336,3 +2411,3911 @@ notrace u64 __weak running_clock(void)
 {
 	return local_clock();
 }
+struct  alarm {
+	struct  alarm   *al_next;               /* next alarm in chain */
+	struct  alarm   *al_prev;               /* previous alarm in chain */
+	int                             al_status;              /* alarm status */
+	mach_timespec_t al_time;                /* alarm time */
+	struct {                                /* message alarm data */
+		int                             type;           /* alarm type */
+		ipc_port_t              port;           /* alarm port */
+		mach_msg_type_name_t
+		    port_type;                                  /* alarm port type */
+		struct  clock   *clock;         /* alarm clock */
+		void                    *data;          /* alarm data */
+	} al_alrm;
+#define al_type         al_alrm.type
+#define al_port         al_alrm.port
+#define al_port_type    al_alrm.port_type
+#define al_clock        al_alrm.clock
+#define al_data         al_alrm.data
+	long                    al_seqno;               /* alarm sequence number */
+};
+typedef struct alarm    alarm_data_t;
+
+/* alarm status */
+#define ALARM_FREE      0               /* alarm is on free list */
+#define ALARM_SLEEP     1               /* active clock_sleep() */
+#define ALARM_CLOCK     2               /* active clock_alarm() */
+#define ALARM_DONE      4               /* alarm has expired */
+
+/* local data declarations */
+decl_simple_lock_data(static, alarm_lock);       /* alarm synchronization */
+/* zone for user alarms */
+static KALLOC_TYPE_DEFINE(alarm_zone, struct alarm, KT_DEFAULT);
+static struct   alarm           *alrmfree;              /* alarm free list pointer */
+static struct   alarm           *alrmdone;              /* alarm done list pointer */
+static struct   alarm           *alrmlist;
+static long                     alrm_seqno;             /* uniquely identifies alarms */
+static thread_call_data_t       alarm_done_call;
+static timer_call_data_t        alarm_expire_timer;
+
+extern  struct clock    clock_list[];
+extern  int             clock_count;
+
+static void             post_alarm(
+	alarm_t                 alarm);
+
+static void             set_alarm(
+	mach_timespec_t *alarm_time);
+
+static int              check_time(
+	alarm_type_t    alarm_type,
+	mach_timespec_t *alarm_time,
+	mach_timespec_t *clock_time);
+
+static void             alarm_done(void);
+
+static void             alarm_expire(void);
+
+static kern_return_t    clock_sleep_internal(
+	clock_t                         clock,
+	sleep_type_t            sleep_type,
+	mach_timespec_t         *sleep_time);
+
+int             rtclock_init(void);
+
+kern_return_t   rtclock_gettime(
+	mach_timespec_t                 *cur_time);
+
+kern_return_t   rtclock_getattr(
+	clock_flavor_t                  flavor,
+	clock_attr_t                    attr,
+	mach_msg_type_number_t  *count);
+
+SECURITY_READ_ONLY_EARLY(struct clock_ops) sysclk_ops = {
+	.c_config   = NULL,
+	.c_init     = rtclock_init,
+	.c_gettime  = rtclock_gettime,
+	.c_getattr  = rtclock_getattr,
+};
+
+kern_return_t   calend_gettime(
+	mach_timespec_t                 *cur_time);
+
+kern_return_t   calend_getattr(
+	clock_flavor_t                  flavor,
+	clock_attr_t                    attr,
+	mach_msg_type_number_t  *count);
+
+SECURITY_READ_ONLY_EARLY(struct clock_ops) calend_ops = {
+	.c_config   = NULL,
+	.c_init     = NULL,
+	.c_gettime  = calend_gettime,
+	.c_getattr  = calend_getattr,
+};
+
+/*
+ * List of clock devices.
+ */
+SECURITY_READ_ONLY_LATE(struct clock) clock_list[] = {
+	[SYSTEM_CLOCK] = {
+		.cl_ops     = &sysclk_ops,
+		.cl_service = IPC_PORT_NULL,
+	},
+	[CALENDAR_CLOCK] = {
+		.cl_ops     = &calend_ops,
+		.cl_service = IPC_PORT_NULL,
+	},
+};
+int     clock_count = sizeof(clock_list) / sizeof(clock_list[0]);
+
+/*
+ *	Macros to lock/unlock clock system.
+ */
+#define LOCK_ALARM(s)                   \
+	s = splclock();                 \
+	simple_lock(&alarm_lock, LCK_GRP_NULL);
+
+#define UNLOCK_ALARM(s)                 \
+	simple_unlock(&alarm_lock);     \
+	splx(s);
+
+void
+clock_oldconfig(void)
+{
+	clock_t                 clock;
+	int     i;
+
+	simple_lock_init(&alarm_lock, 0);
+	thread_call_setup(&alarm_done_call, (thread_call_func_t)alarm_done, NULL);
+	timer_call_setup(&alarm_expire_timer, (timer_call_func_t)alarm_expire, NULL);
+
+	/*
+	 * Configure clock devices.
+	 */
+	for (i = 0; i < clock_count; i++) {
+		clock = &clock_list[i];
+		if (clock->cl_ops && clock->cl_ops->c_config) {
+			if ((*clock->cl_ops->c_config)() == 0) {
+				clock->cl_ops = NULL;
+			}
+		}
+	}
+
+	/* start alarm sequence numbers at 0 */
+	alrm_seqno = 0;
+}
+
+void
+clock_oldinit(void)
+{
+	clock_t                 clock;
+	int     i;
+
+	/*
+	 * Initialize basic clock structures.
+	 */
+	for (i = 0; i < clock_count; i++) {
+		clock = &clock_list[i];
+		if (clock->cl_ops && clock->cl_ops->c_init) {
+			(*clock->cl_ops->c_init)();
+		}
+	}
+}
+
+/*
+ * Initialize the clock ipc service facility.
+ */
+void
+clock_service_create(void)
+{
+	/*
+	 * Initialize ipc clock services.
+	 */
+	for (int i = 0; i < clock_count; i++) {
+		clock_t clock = &clock_list[i];
+		if (clock->cl_ops) {
+			ipc_clock_init(clock);
+		}
+	}
+}
+
+/*
+ * Get the service port on a clock.
+ */
+kern_return_t
+host_get_clock_service(
+	host_t                  host,
+	clock_id_t              clock_id,
+	clock_t                 *clock)         /* OUT */
+{
+	if (host == HOST_NULL || clock_id < 0 || clock_id >= clock_count) {
+		*clock = CLOCK_NULL;
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	*clock = &clock_list[clock_id];
+	if ((*clock)->cl_ops == 0) {
+		return KERN_FAILURE;
+	}
+	return KERN_SUCCESS;
+}
+
+/*
+ * Get the current clock time.
+ */
+kern_return_t
+clock_get_time(
+	clock_t                 clock,
+	mach_timespec_t *cur_time)      /* OUT */
+{
+	if (clock == CLOCK_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	return (*clock->cl_ops->c_gettime)(cur_time);
+}
+
+kern_return_t
+rtclock_gettime(
+	mach_timespec_t         *time)  /* OUT */
+{
+	clock_sec_t             secs;
+	clock_nsec_t    nsecs;
+
+	clock_get_system_nanotime(&secs, &nsecs);
+	time->tv_sec = (unsigned int)secs;
+	time->tv_nsec = nsecs;
+
+	return KERN_SUCCESS;
+}
+
+kern_return_t
+calend_gettime(
+	mach_timespec_t         *time)  /* OUT */
+{
+	clock_sec_t             secs;
+	clock_nsec_t    nsecs;
+
+	clock_get_calendar_nanotime(&secs, &nsecs);
+	time->tv_sec = (unsigned int)secs;
+	time->tv_nsec = nsecs;
+
+	return KERN_SUCCESS;
+}
+
+/*
+ * Get clock attributes.
+ */
+kern_return_t
+clock_get_attributes(
+	clock_t                                 clock,
+	clock_flavor_t                  flavor,
+	clock_attr_t                    attr,           /* OUT */
+	mach_msg_type_number_t  *count)         /* IN/OUT */
+{
+	if (clock == CLOCK_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	if (clock->cl_ops->c_getattr) {
+		return clock->cl_ops->c_getattr(flavor, attr, count);
+	}
+	return KERN_FAILURE;
+}
+
+kern_return_t
+rtclock_getattr(
+	clock_flavor_t                  flavor,
+	clock_attr_t                    attr,           /* OUT */
+	mach_msg_type_number_t  *count)         /* IN/OUT */
+{
+	if (*count != 1) {
+		return KERN_FAILURE;
+	}
+
+	switch (flavor) {
+	case CLOCK_GET_TIME_RES:        /* >0 res */
+	case CLOCK_ALARM_CURRES:        /* =0 no alarm */
+	case CLOCK_ALARM_MINRES:
+	case CLOCK_ALARM_MAXRES:
+		*(clock_res_t *) attr = NSEC_PER_SEC / 100;
+		break;
+
+	default:
+		return KERN_INVALID_VALUE;
+	}
+
+	return KERN_SUCCESS;
+}
+
+kern_return_t
+calend_getattr(
+	clock_flavor_t                  flavor,
+	clock_attr_t                    attr,           /* OUT */
+	mach_msg_type_number_t  *count)         /* IN/OUT */
+{
+	if (*count != 1) {
+		return KERN_FAILURE;
+	}
+
+	switch (flavor) {
+	case CLOCK_GET_TIME_RES:        /* >0 res */
+		*(clock_res_t *) attr = NSEC_PER_SEC / 100;
+		break;
+
+	case CLOCK_ALARM_CURRES:        /* =0 no alarm */
+	case CLOCK_ALARM_MINRES:
+	case CLOCK_ALARM_MAXRES:
+		*(clock_res_t *) attr = 0;
+		break;
+
+	default:
+		return KERN_INVALID_VALUE;
+	}
+
+	return KERN_SUCCESS;
+}
+
+/*
+ * Setup a clock alarm.
+ */
+kern_return_t
+clock_alarm(
+	clock_t                                 clock,
+	alarm_type_t                    alarm_type,
+	mach_timespec_t                 alarm_time,
+	ipc_port_t                              alarm_port,
+	mach_msg_type_name_t    alarm_port_type)
+{
+	alarm_t                                 alarm;
+	mach_timespec_t                 clock_time;
+	int                                             chkstat;
+	kern_return_t                   reply_code;
+	spl_t                                   s;
+
+	if (clock == CLOCK_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	if (clock != &clock_list[SYSTEM_CLOCK]) {
+		return KERN_FAILURE;
+	}
+	if (IP_VALID(alarm_port) == 0) {
+		return KERN_INVALID_CAPABILITY;
+	}
+
+	/*
+	 * Check alarm parameters. If parameters are invalid,
+	 * send alarm message immediately.
+	 */
+	(*clock->cl_ops->c_gettime)(&clock_time);
+	chkstat = check_time(alarm_type, &alarm_time, &clock_time);
+	if (chkstat <= 0) {
+		reply_code = (chkstat < 0 ? KERN_INVALID_VALUE : KERN_SUCCESS);
+		clock_alarm_reply(alarm_port, alarm_port_type,
+		    reply_code, alarm_type, clock_time);
+		return KERN_SUCCESS;
+	}
+
+	/*
+	 * Get alarm and add to clock alarm list.
+	 */
+
+	LOCK_ALARM(s);
+	if ((alarm = alrmfree) == 0) {
+		UNLOCK_ALARM(s);
+		alarm = zalloc_flags(alarm_zone, Z_WAITOK | Z_NOFAIL);
+		LOCK_ALARM(s);
+	} else {
+		alrmfree = alarm->al_next;
+	}
+
+	alarm->al_status = ALARM_CLOCK;
+	alarm->al_time = alarm_time;
+	alarm->al_type = alarm_type;
+	alarm->al_port = alarm_port;
+	alarm->al_port_type = alarm_port_type;
+	alarm->al_clock = clock;
+	alarm->al_seqno = alrm_seqno++;
+	post_alarm(alarm);
+	UNLOCK_ALARM(s);
+
+	return KERN_SUCCESS;
+}
+
+/*
+ * Sleep on a clock. System trap. User-level libmach clock_sleep
+ * interface call takes a mach_timespec_t sleep_time argument which it
+ * converts to sleep_sec and sleep_nsec arguments which are then
+ * passed to clock_sleep_trap.
+ */
+kern_return_t
+clock_sleep_trap(
+	struct clock_sleep_trap_args *args)
+{
+	mach_port_name_t        clock_name = args->clock_name;
+	sleep_type_t            sleep_type = args->sleep_type;
+	int                                     sleep_sec = args->sleep_sec;
+	int                                     sleep_nsec = args->sleep_nsec;
+	mach_vm_address_t       wakeup_time_addr = args->wakeup_time;
+	clock_t                         clock;
+	mach_timespec_t         swtime = {};
+	kern_return_t           rvalue;
+
+	/*
+	 * Convert the trap parameters.
+	 */
+	if (clock_name == MACH_PORT_NULL) {
+		clock = &clock_list[SYSTEM_CLOCK];
+	} else {
+		clock = port_name_to_clock(clock_name);
+	}
+
+	swtime.tv_sec  = sleep_sec;
+	swtime.tv_nsec = sleep_nsec;
+
+	/*
+	 * Call the actual clock_sleep routine.
+	 */
+	rvalue = clock_sleep_internal(clock, sleep_type, &swtime);
+
+	/*
+	 * Return current time as wakeup time.
+	 */
+	if (rvalue != KERN_INVALID_ARGUMENT && rvalue != KERN_FAILURE) {
+		copyout((char *)&swtime, wakeup_time_addr, sizeof(mach_timespec_t));
+	}
+	return rvalue;
+}
+
+static kern_return_t
+clock_sleep_internal(
+	clock_t                         clock,
+	sleep_type_t            sleep_type,
+	mach_timespec_t         *sleep_time)
+{
+	alarm_t                         alarm;
+	mach_timespec_t         clock_time;
+	kern_return_t           rvalue;
+	int                                     chkstat;
+	spl_t                           s;
+
+	if (clock == CLOCK_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	if (clock != &clock_list[SYSTEM_CLOCK]) {
+		return KERN_FAILURE;
+	}
+
+	/*
+	 * Check sleep parameters. If parameters are invalid
+	 * return an error, otherwise post alarm request.
+	 */
+	(*clock->cl_ops->c_gettime)(&clock_time);
+
+	chkstat = check_time(sleep_type, sleep_time, &clock_time);
+	if (chkstat < 0) {
+		return KERN_INVALID_VALUE;
+	}
+	rvalue = KERN_SUCCESS;
+	if (chkstat > 0) {
+		wait_result_t wait_result;
+
+		/*
+		 * Get alarm and add to clock alarm list.
+		 */
+
+		LOCK_ALARM(s);
+		if ((alarm = alrmfree) == 0) {
+			UNLOCK_ALARM(s);
+			alarm = zalloc_flags(alarm_zone, Z_WAITOK | Z_NOFAIL);
+			LOCK_ALARM(s);
+		} else {
+			alrmfree = alarm->al_next;
+		}
+
+		/*
+		 * Wait for alarm to occur.
+		 */
+		wait_result = assert_wait((event_t)alarm, THREAD_ABORTSAFE);
+		if (wait_result == THREAD_WAITING) {
+			alarm->al_time = *sleep_time;
+			alarm->al_status = ALARM_SLEEP;
+			post_alarm(alarm);
+			UNLOCK_ALARM(s);
+
+			wait_result = thread_block(THREAD_CONTINUE_NULL);
+
+			/*
+			 * Note if alarm expired normally or whether it
+			 * was aborted. If aborted, delete alarm from
+			 * clock alarm list. Return alarm to free list.
+			 */
+			LOCK_ALARM(s);
+			if (alarm->al_status != ALARM_DONE) {
+				assert(wait_result != THREAD_AWAKENED);
+				if (((alarm->al_prev)->al_next = alarm->al_next) != NULL) {
+					(alarm->al_next)->al_prev = alarm->al_prev;
+				}
+				rvalue = KERN_ABORTED;
+			}
+			*sleep_time = alarm->al_time;
+			alarm->al_status = ALARM_FREE;
+		} else {
+			assert(wait_result == THREAD_INTERRUPTED);
+			assert(alarm->al_status == ALARM_FREE);
+			rvalue = KERN_ABORTED;
+		}
+		alarm->al_next = alrmfree;
+		alrmfree = alarm;
+		UNLOCK_ALARM(s);
+	} else {
+		*sleep_time = clock_time;
+	}
+
+	return rvalue;
+}
+
+/*
+ * Service clock alarm expirations.
+ */
+static void
+alarm_expire(void)
+{
+	clock_t                         clock;
+	alarm_t alrm1;
+	alarm_t alrm2;
+	mach_timespec_t         clock_time;
+	mach_timespec_t         *alarm_time;
+	spl_t                           s;
+
+	clock = &clock_list[SYSTEM_CLOCK];
+	(*clock->cl_ops->c_gettime)(&clock_time);
+
+	/*
+	 * Update clock alarm list. Alarms that are due are moved
+	 * to the alarmdone list to be serviced by a thread callout.
+	 */
+	LOCK_ALARM(s);
+	alrm1 = (alarm_t)&alrmlist;
+	while ((alrm2 = alrm1->al_next) != NULL) {
+		alarm_time = &alrm2->al_time;
+		if (CMP_MACH_TIMESPEC(alarm_time, &clock_time) > 0) {
+			break;
+		}
+
+		/*
+		 * Alarm has expired, so remove it from the
+		 * clock alarm list.
+		 */
+		if ((alrm1->al_next = alrm2->al_next) != NULL) {
+			(alrm1->al_next)->al_prev = alrm1;
+		}
+
+		/*
+		 * If a clock_sleep() alarm, wakeup the thread
+		 * which issued the clock_sleep() call.
+		 */
+		if (alrm2->al_status == ALARM_SLEEP) {
+			alrm2->al_next = NULL;
+			alrm2->al_status = ALARM_DONE;
+			alrm2->al_time = clock_time;
+			thread_wakeup((event_t)alrm2);
+		}
+		/*
+		 * If a clock_alarm() alarm, place the alarm on
+		 * the alarm done list and schedule the alarm
+		 * delivery mechanism.
+		 */
+		else {
+			assert(alrm2->al_status == ALARM_CLOCK);
+			if ((alrm2->al_next = alrmdone) != NULL) {
+				alrmdone->al_prev = alrm2;
+			} else {
+				thread_call_enter(&alarm_done_call);
+			}
+			alrm2->al_prev = (alarm_t)&alrmdone;
+			alrmdone = alrm2;
+			alrm2->al_status = ALARM_DONE;
+			alrm2->al_time = clock_time;
+		}
+	}
+
+	/*
+	 * Setup to expire for the next pending alarm.
+	 */
+	if (alrm2) {
+		set_alarm(alarm_time);
+	}
+	UNLOCK_ALARM(s);
+}
+
+static void
+alarm_done(void)
+{
+	alarm_t alrm;
+	kern_return_t           code;
+	spl_t                           s;
+
+	LOCK_ALARM(s);
+	while ((alrm = alrmdone) != NULL) {
+		if ((alrmdone = alrm->al_next) != NULL) {
+			alrmdone->al_prev = (alarm_t)&alrmdone;
+		}
+		UNLOCK_ALARM(s);
+
+		code = (alrm->al_status == ALARM_DONE? KERN_SUCCESS: KERN_ABORTED);
+		if (alrm->al_port != IP_NULL) {
+			/* Deliver message to designated port */
+			if (IP_VALID(alrm->al_port)) {
+				clock_alarm_reply(alrm->al_port, alrm->al_port_type, code,
+				    alrm->al_type, alrm->al_time);
+			}
+
+			LOCK_ALARM(s);
+			alrm->al_status = ALARM_FREE;
+			alrm->al_next = alrmfree;
+			alrmfree = alrm;
+		} else {
+			panic("clock_alarm_deliver");
+		}
+	}
+
+	UNLOCK_ALARM(s);
+}
+
+/*
+ * Post an alarm on the active alarm list.
+ *
+ * Always called from within a LOCK_ALARM() code section.
+ */
+static void
+post_alarm(
+	alarm_t                         alarm)
+{
+	alarm_t alrm1, alrm2;
+	mach_timespec_t         *alarm_time;
+	mach_timespec_t         *queue_time;
+
+	/*
+	 * Traverse alarm list until queue time is greater
+	 * than alarm time, then insert alarm.
+	 */
+	alarm_time = &alarm->al_time;
+	alrm1 = (alarm_t)&alrmlist;
+	while ((alrm2 = alrm1->al_next) != NULL) {
+		queue_time = &alrm2->al_time;
+		if (CMP_MACH_TIMESPEC(queue_time, alarm_time) > 0) {
+			break;
+		}
+		alrm1 = alrm2;
+	}
+	alrm1->al_next = alarm;
+	alarm->al_next = alrm2;
+	alarm->al_prev = alrm1;
+	if (alrm2) {
+		alrm2->al_prev  = alarm;
+	}
+
+	/*
+	 * If the inserted alarm is the 'earliest' alarm,
+	 * reset the device layer alarm time accordingly.
+	 */
+	if (alrmlist == alarm) {
+		set_alarm(alarm_time);
+	}
+}
+
+static void
+set_alarm(
+	mach_timespec_t         *alarm_time)
+{
+	uint64_t        abstime;
+
+	nanotime_to_absolutetime(alarm_time->tv_sec, alarm_time->tv_nsec, &abstime);
+	timer_call_enter_with_leeway(&alarm_expire_timer, NULL, abstime, 0, TIMER_CALL_USER_NORMAL, FALSE);
+}
+
+/*
+ * Check the validity of 'alarm_time' and 'alarm_type'. If either
+ * argument is invalid, return a negative value. If the 'alarm_time'
+ * is now, return a 0 value. If the 'alarm_time' is in the future,
+ * return a positive value.
+ */
+static int
+check_time(
+	alarm_type_t            alarm_type,
+	mach_timespec_t         *alarm_time,
+	mach_timespec_t         *clock_time)
+{
+	int                                     result;
+
+	if (BAD_ALRMTYPE(alarm_type)) {
+		return -1;
+	}
+	if (BAD_MACH_TIMESPEC(alarm_time)) {
+		return -1;
+	}
+	if ((alarm_type & ALRMTYPE) == TIME_RELATIVE) {
+		ADD_MACH_TIMESPEC(alarm_time, clock_time);
+	}
+
+	result = CMP_MACH_TIMESPEC(alarm_time, clock_time);
+
+	return (result >= 0)? result: 0;
+}
+
+#ifndef __LP64__
+
+mach_timespec_t
+clock_get_system_value(void)
+{
+	clock_t                         clock = &clock_list[SYSTEM_CLOCK];
+	mach_timespec_t         value;
+
+	(void) (*clock->cl_ops->c_gettime)(&value);
+
+	return value;
+}
+
+mach_timespec_t
+clock_get_calendar_value(void)
+{
+	clock_t                         clock = &clock_list[CALENDAR_CLOCK];
+	mach_timespec_t         value = MACH_TIMESPEC_ZERO;
+
+	(void) (*clock->cl_ops->c_gettime)(&value);
+
+	return value;
+}
+
+#endif  /* __LP64__ */
+
+static struct alarm_base {
+	spinlock_t		lock;
+	struct timerqueue_head	timerqueue;
+	ktime_t			(*get_ktime)(void);
+	void			(*get_timespec)(struct timespec64 *tp);
+	clockid_t		base_clockid;
+} alarm_bases[ALARM_NUMTYPE];
+
+#if defined(CONFIG_POSIX_TIMERS) || defined(CONFIG_RTC_CLASS)
+/* freezer information to handle clock_nanosleep triggered wakeups */
+static enum alarmtimer_type freezer_alarmtype;
+static ktime_t freezer_expires;
+static ktime_t freezer_delta;
+static DEFINE_SPINLOCK(freezer_delta_lock);
+#endif
+
+#ifdef CONFIG_RTC_CLASS
+/* rtc timer and device for setting alarm wakeups at suspend */
+static struct rtc_timer		rtctimer;
+static struct rtc_device	*rtcdev;
+static DEFINE_SPINLOCK(rtcdev_lock);
+
+/**
+ * alarmtimer_get_rtcdev - Return selected rtcdevice
+ *
+ * This function returns the rtc device to use for wakealarms.
+ */
+struct rtc_device *alarmtimer_get_rtcdev(void)
+{
+	struct rtc_device *ret;
+
+	guard(spinlock_irqsave)(&rtcdev_lock);
+	ret = rtcdev;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(alarmtimer_get_rtcdev);
+
+static int alarmtimer_rtc_add_device(struct device *dev)
+{
+	struct rtc_device *rtc = to_rtc_device(dev);
+	struct platform_device *pdev;
+	int ret = 0;
+
+	if (rtcdev)
+		return -EBUSY;
+
+	if (!test_bit(RTC_FEATURE_ALARM, rtc->features))
+		return -1;
+	if (!device_may_wakeup(rtc->dev.parent))
+		return -1;
+
+	pdev = platform_device_register_data(dev, "alarmtimer",
+					     PLATFORM_DEVID_AUTO, NULL, 0);
+	if (!IS_ERR(pdev))
+		device_init_wakeup(&pdev->dev, true);
+
+	scoped_guard(spinlock_irqsave, &rtcdev_lock) {
+		if (!IS_ERR(pdev) && !rtcdev && try_module_get(rtc->owner)) {
+			rtcdev = rtc;
+			/* hold a reference so it doesn't go away */
+			get_device(dev);
+			pdev = NULL;
+		} else {
+			ret = -1;
+		}
+	}
+
+	platform_device_unregister(pdev);
+	return ret;
+}
+
+static inline void alarmtimer_rtc_timer_init(void)
+{
+	rtc_timer_init(&rtctimer, NULL, NULL);
+}
+
+static struct class_interface alarmtimer_rtc_interface = {
+	.add_dev = &alarmtimer_rtc_add_device,
+};
+
+static int alarmtimer_rtc_interface_setup(void)
+{
+	alarmtimer_rtc_interface.class = &rtc_class;
+	return class_interface_register(&alarmtimer_rtc_interface);
+}
+static void alarmtimer_rtc_interface_remove(void)
+{
+	class_interface_unregister(&alarmtimer_rtc_interface);
+}
+#else
+static inline int alarmtimer_rtc_interface_setup(void) { return 0; }
+static inline void alarmtimer_rtc_interface_remove(void) { }
+static inline void alarmtimer_rtc_timer_init(void) { }
+#endif
+
+/**
+ * alarmtimer_enqueue - Adds an alarm timer to an alarm_base timerqueue
+ * @base: pointer to the base where the timer is being run
+ * @alarm: pointer to alarm being enqueued.
+ *
+ * Adds alarm to a alarm_base timerqueue
+ *
+ * Must hold base->lock when calling.
+ */
+static void alarmtimer_enqueue(struct alarm_base *base, struct alarm *alarm)
+{
+	if (alarm->state & ALARMTIMER_STATE_ENQUEUED)
+		timerqueue_del(&base->timerqueue, &alarm->node);
+
+	timerqueue_add(&base->timerqueue, &alarm->node);
+	alarm->state |= ALARMTIMER_STATE_ENQUEUED;
+}
+
+/**
+ * alarmtimer_dequeue - Removes an alarm timer from an alarm_base timerqueue
+ * @base: pointer to the base where the timer is running
+ * @alarm: pointer to alarm being removed
+ *
+ * Removes alarm to a alarm_base timerqueue
+ *
+ * Must hold base->lock when calling.
+ */
+static void alarmtimer_dequeue(struct alarm_base *base, struct alarm *alarm)
+{
+	if (!(alarm->state & ALARMTIMER_STATE_ENQUEUED))
+		return;
+
+	timerqueue_del(&base->timerqueue, &alarm->node);
+	alarm->state &= ~ALARMTIMER_STATE_ENQUEUED;
+}
+
+
+/**
+ * alarmtimer_fired - Handles alarm hrtimer being fired.
+ * @timer: pointer to hrtimer being run
+ *
+ * When a alarm timer fires, this runs through the timerqueue to
+ * see which alarms expired, and runs those. If there are more alarm
+ * timers queued for the future, we set the hrtimer to fire when
+ * the next future alarm timer expires.
+ */
+static enum hrtimer_restart alarmtimer_fired(struct hrtimer *timer)
+{
+	struct alarm *alarm = container_of(timer, struct alarm, timer);
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	scoped_guard(spinlock_irqsave, &base->lock)
+		alarmtimer_dequeue(base, alarm);
+
+	if (alarm->function)
+		alarm->function(alarm, base->get_ktime());
+
+	trace_alarmtimer_fired(alarm, base->get_ktime());
+	return HRTIMER_NORESTART;
+}
+
+ktime_t alarm_expires_remaining(const struct alarm *alarm)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+	return ktime_sub(alarm->node.expires, base->get_ktime());
+}
+EXPORT_SYMBOL_GPL(alarm_expires_remaining);
+
+#ifdef CONFIG_RTC_CLASS
+/**
+ * alarmtimer_suspend - Suspend time callback
+ * @dev: unused
+ *
+ * When we are going into suspend, we look through the bases
+ * to see which is the soonest timer to expire. We then
+ * set an rtc timer to fire that far into the future, which
+ * will wake us from suspend.
+ */
+static int alarmtimer_suspend(struct device *dev)
+{
+	ktime_t min, now, expires;
+	struct rtc_device *rtc;
+	struct rtc_time tm;
+	int i, ret, type;
+
+	scoped_guard(spinlock_irqsave, &freezer_delta_lock) {
+		min = freezer_delta;
+		expires = freezer_expires;
+		type = freezer_alarmtype;
+		freezer_delta = 0;
+	}
+
+	rtc = alarmtimer_get_rtcdev();
+	/* If we have no rtcdev, just return */
+	if (!rtc)
+		return 0;
+
+	/* Find the soonest timer to expire*/
+	for (i = 0; i < ALARM_NUMTYPE; i++) {
+		struct alarm_base *base = &alarm_bases[i];
+		struct timerqueue_node *next;
+		ktime_t delta;
+
+		scoped_guard(spinlock_irqsave, &base->lock)
+			next = timerqueue_getnext(&base->timerqueue);
+		if (!next)
+			continue;
+		delta = ktime_sub(next->expires, base->get_ktime());
+		if (!min || (delta < min)) {
+			expires = next->expires;
+			min = delta;
+			type = i;
+		}
+	}
+	if (min == 0)
+		return 0;
+
+	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
+		pm_wakeup_event(dev, 2 * MSEC_PER_SEC);
+		return -EBUSY;
+	}
+
+	trace_alarmtimer_suspend(expires, type);
+
+	/* Setup an rtc timer to fire that far in the future */
+	rtc_timer_cancel(rtc, &rtctimer);
+	rtc_read_time(rtc, &tm);
+	now = rtc_tm_to_ktime(tm);
+
+	/*
+	 * If the RTC alarm timer only supports a limited time offset, set the
+	 * alarm time to the maximum supported value.
+	 * The system may wake up earlier (possibly much earlier) than expected
+	 * when the alarmtimer runs. This is the best the kernel can do if
+	 * the alarmtimer exceeds the time that the rtc device can be programmed
+	 * for.
+	 */
+	min = rtc_bound_alarmtime(rtc, min);
+
+	now = ktime_add(now, min);
+
+	/* Set alarm, if in the past reject suspend briefly to handle */
+	ret = rtc_timer_start(rtc, &rtctimer, now, 0);
+	if (ret < 0)
+		pm_wakeup_event(dev, MSEC_PER_SEC);
+	return ret;
+}
+
+static int alarmtimer_resume(struct device *dev)
+{
+	struct rtc_device *rtc;
+
+	rtc = alarmtimer_get_rtcdev();
+	if (rtc)
+		rtc_timer_cancel(rtc, &rtctimer);
+	return 0;
+}
+
+#else
+static int alarmtimer_suspend(struct device *dev)
+{
+	return 0;
+}
+
+static int alarmtimer_resume(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+static void
+__alarm_init(struct alarm *alarm, enum alarmtimer_type type,
+	     void (*function)(struct alarm *, ktime_t))
+{
+	timerqueue_init(&alarm->node);
+	alarm->function = function;
+	alarm->type = type;
+	alarm->state = ALARMTIMER_STATE_INACTIVE;
+}
+
+/**
+ * alarm_init - Initialize an alarm structure
+ * @alarm: ptr to alarm to be initialized
+ * @type: the type of the alarm
+ * @function: callback that is run when the alarm fires
+ */
+void alarm_init(struct alarm *alarm, enum alarmtimer_type type,
+		void (*function)(struct alarm *, ktime_t))
+{
+	hrtimer_setup(&alarm->timer, alarmtimer_fired, alarm_bases[type].base_clockid,
+		      HRTIMER_MODE_ABS);
+	__alarm_init(alarm, type, function);
+}
+EXPORT_SYMBOL_GPL(alarm_init);
+
+/**
+ * alarm_start - Sets an absolute alarm to fire
+ * @alarm: ptr to alarm to set
+ * @start: time to run the alarm
+ */
+void alarm_start(struct alarm *alarm, ktime_t start)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	scoped_guard(spinlock_irqsave, &base->lock) {
+		alarm->node.expires = start;
+		alarmtimer_enqueue(base, alarm);
+		hrtimer_start(&alarm->timer, alarm->node.expires, HRTIMER_MODE_ABS);
+	}
+
+	trace_alarmtimer_start(alarm, base->get_ktime());
+}
+EXPORT_SYMBOL_GPL(alarm_start);
+
+/**
+ * alarm_start_relative - Sets a relative alarm to fire
+ * @alarm: ptr to alarm to set
+ * @start: time relative to now to run the alarm
+ */
+void alarm_start_relative(struct alarm *alarm, ktime_t start)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	start = ktime_add_safe(start, base->get_ktime());
+	alarm_start(alarm, start);
+}
+EXPORT_SYMBOL_GPL(alarm_start_relative);
+
+void alarm_restart(struct alarm *alarm)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	guard(spinlock_irqsave)(&base->lock);
+	hrtimer_set_expires(&alarm->timer, alarm->node.expires);
+	hrtimer_restart(&alarm->timer);
+	alarmtimer_enqueue(base, alarm);
+}
+EXPORT_SYMBOL_GPL(alarm_restart);
+
+/**
+ * alarm_try_to_cancel - Tries to cancel an alarm timer
+ * @alarm: ptr to alarm to be canceled
+ *
+ * Returns 1 if the timer was canceled, 0 if it was not running,
+ * and -1 if the callback was running
+ */
+int alarm_try_to_cancel(struct alarm *alarm)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+	int ret;
+
+	scoped_guard(spinlock_irqsave, &base->lock) {
+		ret = hrtimer_try_to_cancel(&alarm->timer);
+		if (ret >= 0)
+			alarmtimer_dequeue(base, alarm);
+	}
+
+	trace_alarmtimer_cancel(alarm, base->get_ktime());
+	return ret;
+}
+EXPORT_SYMBOL_GPL(alarm_try_to_cancel);
+
+
+/**
+ * alarm_cancel - Spins trying to cancel an alarm timer until it is done
+ * @alarm: ptr to alarm to be canceled
+ *
+ * Returns 1 if the timer was canceled, 0 if it was not active.
+ */
+int alarm_cancel(struct alarm *alarm)
+{
+	for (;;) {
+		int ret = alarm_try_to_cancel(alarm);
+		if (ret >= 0)
+			return ret;
+		hrtimer_cancel_wait_running(&alarm->timer);
+	}
+}
+EXPORT_SYMBOL_GPL(alarm_cancel);
+
+
+u64 alarm_forward(struct alarm *alarm, ktime_t now, ktime_t interval)
+{
+	u64 overrun = 1;
+	ktime_t delta;
+
+	delta = ktime_sub(now, alarm->node.expires);
+
+	if (delta < 0)
+		return 0;
+
+	if (unlikely(delta >= interval)) {
+		s64 incr = ktime_to_ns(interval);
+
+		overrun = ktime_divns(delta, incr);
+
+		alarm->node.expires = ktime_add_ns(alarm->node.expires,
+							incr*overrun);
+
+		if (alarm->node.expires > now)
+			return overrun;
+		/*
+		 * This (and the ktime_add() below) is the
+		 * correction for exact:
+		 */
+		overrun++;
+	}
+
+	alarm->node.expires = ktime_add_safe(alarm->node.expires, interval);
+	return overrun;
+}
+EXPORT_SYMBOL_GPL(alarm_forward);
+
+u64 alarm_forward_now(struct alarm *alarm, ktime_t interval)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	return alarm_forward(alarm, base->get_ktime(), interval);
+}
+EXPORT_SYMBOL_GPL(alarm_forward_now);
+
+#ifdef CONFIG_POSIX_TIMERS
+
+static void alarmtimer_freezerset(ktime_t absexp, enum alarmtimer_type type)
+{
+	struct alarm_base *base;
+	ktime_t delta;
+
+	switch(type) {
+	case ALARM_REALTIME:
+		base = &alarm_bases[ALARM_REALTIME];
+		type = ALARM_REALTIME_FREEZER;
+		break;
+	case ALARM_BOOTTIME:
+		base = &alarm_bases[ALARM_BOOTTIME];
+		type = ALARM_BOOTTIME_FREEZER;
+		break;
+	default:
+		WARN_ONCE(1, "Invalid alarm type: %d\n", type);
+		return;
+	}
+
+	delta = ktime_sub(absexp, base->get_ktime());
+
+	guard(spinlock_irqsave)(&freezer_delta_lock);
+	if (!freezer_delta || (delta < freezer_delta)) {
+		freezer_delta = delta;
+		freezer_expires = absexp;
+		freezer_alarmtype = type;
+	}
+}
+
+/**
+ * clock2alarm - helper that converts from clockid to alarmtypes
+ * @clockid: clockid.
+ */
+static enum alarmtimer_type clock2alarm(clockid_t clockid)
+{
+	if (clockid == CLOCK_REALTIME_ALARM)
+		return ALARM_REALTIME;
+
+	WARN_ON_ONCE(clockid != CLOCK_BOOTTIME_ALARM);
+	return ALARM_BOOTTIME;
+}
+
+/**
+ * alarm_handle_timer - Callback for posix timers
+ * @alarm: alarm that fired
+ * @now: time at the timer expiration
+ *
+ * Posix timer callback for expired alarm timers.
+ *
+ * Return: whether the timer is to be restarted
+ */
+static void alarm_handle_timer(struct alarm *alarm, ktime_t now)
+{
+	struct k_itimer *ptr = container_of(alarm, struct k_itimer, it.alarm.alarmtimer);
+
+	guard(spinlock_irqsave)(&ptr->it_lock);
+	posix_timer_queue_signal(ptr);
+}
+
+/**
+ * alarm_timer_rearm - Posix timer callback for rearming timer
+ * @timr:	Pointer to the posixtimer data struct
+ */
+static void alarm_timer_rearm(struct k_itimer *timr)
+{
+	struct alarm *alarm = &timr->it.alarm.alarmtimer;
+
+	timr->it_overrun += alarm_forward_now(alarm, timr->it_interval);
+	alarm_start(alarm, alarm->node.expires);
+}
+
+/**
+ * alarm_timer_forward - Posix timer callback for forwarding timer
+ * @timr:	Pointer to the posixtimer data struct
+ * @now:	Current time to forward the timer against
+ */
+static s64 alarm_timer_forward(struct k_itimer *timr, ktime_t now)
+{
+	struct alarm *alarm = &timr->it.alarm.alarmtimer;
+
+	return alarm_forward(alarm, timr->it_interval, now);
+}
+
+/**
+ * alarm_timer_remaining - Posix timer callback to retrieve remaining time
+ * @timr:	Pointer to the posixtimer data struct
+ * @now:	Current time to calculate against
+ */
+static ktime_t alarm_timer_remaining(struct k_itimer *timr, ktime_t now)
+{
+	struct alarm *alarm = &timr->it.alarm.alarmtimer;
+
+	return ktime_sub(alarm->node.expires, now);
+}
+
+/**
+ * alarm_timer_try_to_cancel - Posix timer callback to cancel a timer
+ * @timr:	Pointer to the posixtimer data struct
+ */
+static int alarm_timer_try_to_cancel(struct k_itimer *timr)
+{
+	return alarm_try_to_cancel(&timr->it.alarm.alarmtimer);
+}
+
+/**
+ * alarm_timer_wait_running - Posix timer callback to wait for a timer
+ * @timr:	Pointer to the posixtimer data struct
+ *
+ * Called from the core code when timer cancel detected that the callback
+ * is running. @timr is unlocked and rcu read lock is held to prevent it
+ * from being freed.
+ */
+static void alarm_timer_wait_running(struct k_itimer *timr)
+{
+	hrtimer_cancel_wait_running(&timr->it.alarm.alarmtimer.timer);
+}
+
+/**
+ * alarm_timer_arm - Posix timer callback to arm a timer
+ * @timr:	Pointer to the posixtimer data struct
+ * @expires:	The new expiry time
+ * @absolute:	Expiry value is absolute time
+ * @sigev_none:	Posix timer does not deliver signals
+ */
+static void alarm_timer_arm(struct k_itimer *timr, ktime_t expires,
+			    bool absolute, bool sigev_none)
+{
+	struct alarm *alarm = &timr->it.alarm.alarmtimer;
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	if (!absolute)
+		expires = ktime_add_safe(expires, base->get_ktime());
+	if (sigev_none)
+		alarm->node.expires = expires;
+	else
+		alarm_start(&timr->it.alarm.alarmtimer, expires);
+}
+
+/**
+ * alarm_clock_getres - posix getres interface
+ * @which_clock: clockid
+ * @tp: timespec to fill
+ *
+ * Returns the granularity of underlying alarm base clock
+ */
+static int alarm_clock_getres(const clockid_t which_clock, struct timespec64 *tp)
+{
+	if (!alarmtimer_get_rtcdev())
+		return -EINVAL;
+
+	tp->tv_sec = 0;
+	tp->tv_nsec = hrtimer_resolution;
+	return 0;
+}
+
+/**
+ * alarm_clock_get_timespec - posix clock_get_timespec interface
+ * @which_clock: clockid
+ * @tp: timespec to fill.
+ *
+ * Provides the underlying alarm base time in a tasks time namespace.
+ */
+static int alarm_clock_get_timespec(clockid_t which_clock, struct timespec64 *tp)
+{
+	struct alarm_base *base = &alarm_bases[clock2alarm(which_clock)];
+
+	if (!alarmtimer_get_rtcdev())
+		return -EINVAL;
+
+	base->get_timespec(tp);
+
+	return 0;
+}
+
+/**
+ * alarm_clock_get_ktime - posix clock_get_ktime interface
+ * @which_clock: clockid
+ *
+ * Provides the underlying alarm base time in the root namespace.
+ */
+static ktime_t alarm_clock_get_ktime(clockid_t which_clock)
+{
+	struct alarm_base *base = &alarm_bases[clock2alarm(which_clock)];
+
+	if (!alarmtimer_get_rtcdev())
+		return -EINVAL;
+
+	return base->get_ktime();
+}
+
+/**
+ * alarm_timer_create - posix timer_create interface
+ * @new_timer: k_itimer pointer to manage
+ *
+ * Initializes the k_itimer structure.
+ */
+static int alarm_timer_create(struct k_itimer *new_timer)
+{
+	enum  alarmtimer_type type;
+
+	if (!alarmtimer_get_rtcdev())
+		return -EOPNOTSUPP;
+
+	if (!capable(CAP_WAKE_ALARM))
+		return -EPERM;
+
+	type = clock2alarm(new_timer->it_clock);
+	alarm_init(&new_timer->it.alarm.alarmtimer, type, alarm_handle_timer);
+	return 0;
+}
+
+/**
+ * alarmtimer_nsleep_wakeup - Wakeup function for alarm_timer_nsleep
+ * @alarm: ptr to alarm that fired
+ * @now: time at the timer expiration
+ *
+ * Wakes up the task that set the alarmtimer
+ */
+static void alarmtimer_nsleep_wakeup(struct alarm *alarm, ktime_t now)
+{
+	struct task_struct *task = alarm->data;
+
+	alarm->data = NULL;
+	if (task)
+		wake_up_process(task);
+}
+
+/**
+ * alarmtimer_do_nsleep - Internal alarmtimer nsleep implementation
+ * @alarm: ptr to alarmtimer
+ * @absexp: absolute expiration time
+ * @type: alarm type (BOOTTIME/REALTIME).
+ *
+ * Sets the alarm timer and sleeps until it is fired or interrupted.
+ */
+static int alarmtimer_do_nsleep(struct alarm *alarm, ktime_t absexp,
+				enum alarmtimer_type type)
+{
+	struct restart_block *restart;
+	alarm->data = (void *)current;
+	do {
+		set_current_state(TASK_INTERRUPTIBLE);
+		alarm_start(alarm, absexp);
+		if (likely(alarm->data))
+			schedule();
+
+		alarm_cancel(alarm);
+	} while (alarm->data && !signal_pending(current));
+
+	__set_current_state(TASK_RUNNING);
+
+	destroy_hrtimer_on_stack(&alarm->timer);
+
+	if (!alarm->data)
+		return 0;
+
+	if (freezing(current))
+		alarmtimer_freezerset(absexp, type);
+	restart = &current->restart_block;
+	if (restart->nanosleep.type != TT_NONE) {
+		struct timespec64 rmt;
+		ktime_t rem;
+
+		rem = ktime_sub(absexp, alarm_bases[type].get_ktime());
+
+		if (rem <= 0)
+			return 0;
+		rmt = ktime_to_timespec64(rem);
+
+		return nanosleep_copyout(restart, &rmt);
+	}
+	return -ERESTART_RESTARTBLOCK;
+}
+
+static void
+alarm_init_on_stack(struct alarm *alarm, enum alarmtimer_type type,
+		    void (*function)(struct alarm *, ktime_t))
+{
+	hrtimer_setup_on_stack(&alarm->timer, alarmtimer_fired, alarm_bases[type].base_clockid,
+			       HRTIMER_MODE_ABS);
+	__alarm_init(alarm, type, function);
+}
+
+/**
+ * alarm_timer_nsleep_restart - restartblock alarmtimer nsleep
+ * @restart: ptr to restart block
+ *
+ * Handles restarted clock_nanosleep calls
+ */
+static long __sched alarm_timer_nsleep_restart(struct restart_block *restart)
+{
+	enum  alarmtimer_type type = restart->nanosleep.clockid;
+	ktime_t exp = restart->nanosleep.expires;
+	struct alarm alarm;
+
+	alarm_init_on_stack(&alarm, type, alarmtimer_nsleep_wakeup);
+
+	return alarmtimer_do_nsleep(&alarm, exp, type);
+}
+
+/**
+ * alarm_timer_nsleep - alarmtimer nanosleep
+ * @which_clock: clockid
+ * @flags: determines abstime or relative
+ * @tsreq: requested sleep time (abs or rel)
+ *
+ * Handles clock_nanosleep calls against _ALARM clockids
+ */
+static int alarm_timer_nsleep(const clockid_t which_clock, int flags,
+			      const struct timespec64 *tsreq)
+{
+	enum  alarmtimer_type type = clock2alarm(which_clock);
+	struct restart_block *restart = &current->restart_block;
+	struct alarm alarm;
+	ktime_t exp;
+	int ret;
+
+	if (!alarmtimer_get_rtcdev())
+		return -EOPNOTSUPP;
+
+	if (flags & ~TIMER_ABSTIME)
+		return -EINVAL;
+
+	if (!capable(CAP_WAKE_ALARM))
+		return -EPERM;
+
+	alarm_init_on_stack(&alarm, type, alarmtimer_nsleep_wakeup);
+
+	exp = timespec64_to_ktime(*tsreq);
+	/* Convert (if necessary) to absolute time */
+	if (flags != TIMER_ABSTIME) {
+		ktime_t now = alarm_bases[type].get_ktime();
+
+		exp = ktime_add_safe(now, exp);
+	} else {
+		exp = timens_ktime_to_host(which_clock, exp);
+	}
+
+	ret = alarmtimer_do_nsleep(&alarm, exp, type);
+	if (ret != -ERESTART_RESTARTBLOCK)
+		return ret;
+
+	/* abs timers don't set remaining time or restart */
+	if (flags == TIMER_ABSTIME)
+		return -ERESTARTNOHAND;
+
+	restart->nanosleep.clockid = type;
+	restart->nanosleep.expires = exp;
+	set_restart_fn(restart, alarm_timer_nsleep_restart);
+	return ret;
+}
+
+const struct k_clock alarm_clock = {
+	.clock_getres		= alarm_clock_getres,
+	.clock_get_ktime	= alarm_clock_get_ktime,
+	.clock_get_timespec	= alarm_clock_get_timespec,
+	.timer_create		= alarm_timer_create,
+	.timer_set		= common_timer_set,
+	.timer_del		= common_timer_del,
+	.timer_get		= common_timer_get,
+	.timer_arm		= alarm_timer_arm,
+	.timer_rearm		= alarm_timer_rearm,
+	.timer_forward		= alarm_timer_forward,
+	.timer_remaining	= alarm_timer_remaining,
+	.timer_try_to_cancel	= alarm_timer_try_to_cancel,
+	.timer_wait_running	= alarm_timer_wait_running,
+	.nsleep			= alarm_timer_nsleep,
+};
+#endif /* CONFIG_POSIX_TIMERS */
+
+
+/* Suspend hook structures */
+static const struct dev_pm_ops alarmtimer_pm_ops = {
+	.suspend = alarmtimer_suspend,
+	.resume = alarmtimer_resume,
+};
+
+static struct platform_driver alarmtimer_driver = {
+	.driver = {
+		.name = "alarmtimer",
+		.pm = &alarmtimer_pm_ops,
+	}
+};
+
+static void get_boottime_timespec(struct timespec64 *tp)
+{
+	ktime_get_boottime_ts64(tp);
+	timens_add_boottime(tp);
+}
+
+/**
+ * alarmtimer_init - Initialize alarm timer code
+ *
+ * This function initializes the alarm bases and registers
+ * the posix clock ids.
+ */
+static int __init alarmtimer_init(void)
+{
+	int error;
+	int i;
+
+	alarmtimer_rtc_timer_init();
+
+	/* Initialize alarm bases */
+	alarm_bases[ALARM_REALTIME].base_clockid = CLOCK_REALTIME;
+	alarm_bases[ALARM_REALTIME].get_ktime = &ktime_get_real;
+	alarm_bases[ALARM_REALTIME].get_timespec = ktime_get_real_ts64;
+	alarm_bases[ALARM_BOOTTIME].base_clockid = CLOCK_BOOTTIME;
+	alarm_bases[ALARM_BOOTTIME].get_ktime = &ktime_get_boottime;
+	alarm_bases[ALARM_BOOTTIME].get_timespec = get_boottime_timespec;
+	for (i = 0; i < ALARM_NUMTYPE; i++) {
+		timerqueue_init_head(&alarm_bases[i].timerqueue);
+		spin_lock_init(&alarm_bases[i].lock);
+	}
+
+	error = alarmtimer_rtc_interface_setup();
+	if (error)
+		return error;
+
+	error = platform_driver_register(&alarmtimer_driver);
+	if (error)
+		goto out_if;
+
+	return 0;
+out_if:
+	alarmtimer_rtc_interface_remove();
+	return error;
+}
+device_initcall(alarmtimer_init);
+
+static LIST_HEAD(clockevent_devices);
+static LIST_HEAD(clockevents_released);
+/* Protection for the above */
+static DEFINE_RAW_SPINLOCK(clockevents_lock);
+/* Protection for unbind operations */
+static DEFINE_MUTEX(clockevents_mutex);
+
+struct ce_unbind {
+	struct clock_event_device *ce;
+	int res;
+};
+
+static u64 cev_delta2ns(unsigned long latch, struct clock_event_device *evt,
+			bool ismax)
+{
+	u64 clc = (u64) latch << evt->shift;
+	u64 rnd;
+
+	if (WARN_ON(!evt->mult))
+		evt->mult = 1;
+	rnd = (u64) evt->mult - 1;
+
+	/*
+	 * Upper bound sanity check. If the backwards conversion is
+	 * not equal latch, we know that the above shift overflowed.
+	 */
+	if ((clc >> evt->shift) != (u64)latch)
+		clc = ~0ULL;
+
+	/*
+	 * Scaled math oddities:
+	 *
+	 * For mult <= (1 << shift) we can safely add mult - 1 to
+	 * prevent integer rounding loss. So the backwards conversion
+	 * from nsec to device ticks will be correct.
+	 *
+	 * For mult > (1 << shift), i.e. device frequency is > 1GHz we
+	 * need to be careful. Adding mult - 1 will result in a value
+	 * which when converted back to device ticks can be larger
+	 * than latch by up to (mult - 1) >> shift. For the min_delta
+	 * calculation we still want to apply this in order to stay
+	 * above the minimum device ticks limit. For the upper limit
+	 * we would end up with a latch value larger than the upper
+	 * limit of the device, so we omit the add to stay below the
+	 * device upper boundary.
+	 *
+	 * Also omit the add if it would overflow the u64 boundary.
+	 */
+	if ((~0ULL - clc > rnd) &&
+	    (!ismax || evt->mult <= (1ULL << evt->shift)))
+		clc += rnd;
+
+	do_div(clc, evt->mult);
+
+	/* Deltas less than 1usec are pointless noise */
+	return clc > 1000 ? clc : 1000;
+}
+
+/**
+ * clockevent_delta2ns - Convert a latch value (device ticks) to nanoseconds
+ * @latch:	value to convert
+ * @evt:	pointer to clock event device descriptor
+ *
+ * Math helper, returns latch value converted to nanoseconds (bound checked)
+ */
+u64 clockevent_delta2ns(unsigned long latch, struct clock_event_device *evt)
+{
+	return cev_delta2ns(latch, evt, false);
+}
+EXPORT_SYMBOL_GPL(clockevent_delta2ns);
+
+static int __clockevents_switch_state(struct clock_event_device *dev,
+				      enum clock_event_state state)
+{
+	if (dev->features & CLOCK_EVT_FEAT_DUMMY)
+		return 0;
+
+	/* Transition with new state-specific callbacks */
+	switch (state) {
+	case CLOCK_EVT_STATE_DETACHED:
+		/* The clockevent device is getting replaced. Shut it down. */
+
+	case CLOCK_EVT_STATE_SHUTDOWN:
+		if (dev->set_state_shutdown)
+			return dev->set_state_shutdown(dev);
+		return 0;
+
+	case CLOCK_EVT_STATE_PERIODIC:
+		/* Core internal bug */
+		if (!(dev->features & CLOCK_EVT_FEAT_PERIODIC))
+			return -ENOSYS;
+		if (dev->set_state_periodic)
+			return dev->set_state_periodic(dev);
+		return 0;
+
+	case CLOCK_EVT_STATE_ONESHOT:
+		/* Core internal bug */
+		if (!(dev->features & CLOCK_EVT_FEAT_ONESHOT))
+			return -ENOSYS;
+		if (dev->set_state_oneshot)
+			return dev->set_state_oneshot(dev);
+		return 0;
+
+	case CLOCK_EVT_STATE_ONESHOT_STOPPED:
+		/* Core internal bug */
+		if (WARN_ONCE(!clockevent_state_oneshot(dev),
+			      "Current state: %d\n",
+			      clockevent_get_state(dev)))
+			return -EINVAL;
+
+		if (dev->set_state_oneshot_stopped)
+			return dev->set_state_oneshot_stopped(dev);
+		else
+			return -ENOSYS;
+
+	default:
+		return -ENOSYS;
+	}
+}
+
+/**
+ * clockevents_switch_state - set the operating state of a clock event device
+ * @dev:	device to modify
+ * @state:	new state
+ *
+ * Must be called with interrupts disabled !
+ */
+void clockevents_switch_state(struct clock_event_device *dev,
+			      enum clock_event_state state)
+{
+	if (clockevent_get_state(dev) != state) {
+		if (__clockevents_switch_state(dev, state))
+			return;
+
+		clockevent_set_state(dev, state);
+
+		/*
+		 * A nsec2cyc multiplicator of 0 is invalid and we'd crash
+		 * on it, so fix it up and emit a warning:
+		 */
+		if (clockevent_state_oneshot(dev)) {
+			if (WARN_ON(!dev->mult))
+				dev->mult = 1;
+		}
+	}
+}
+
+/**
+ * clockevents_shutdown - shutdown the device and clear next_event
+ * @dev:	device to shutdown
+ */
+void clockevents_shutdown(struct clock_event_device *dev)
+{
+	clockevents_switch_state(dev, CLOCK_EVT_STATE_SHUTDOWN);
+	dev->next_event = KTIME_MAX;
+}
+
+/**
+ * clockevents_tick_resume -	Resume the tick device before using it again
+ * @dev:			device to resume
+ */
+int clockevents_tick_resume(struct clock_event_device *dev)
+{
+	int ret = 0;
+
+	if (dev->tick_resume)
+		ret = dev->tick_resume(dev);
+
+	return ret;
+}
+
+#ifdef CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST
+
+/* Limit min_delta to a jiffy */
+#define MIN_DELTA_LIMIT		(NSEC_PER_SEC / HZ)
+
+/**
+ * clockevents_increase_min_delta - raise minimum delta of a clock event device
+ * @dev:       device to increase the minimum delta
+ *
+ * Returns 0 on success, -ETIME when the minimum delta reached the limit.
+ */
+static int clockevents_increase_min_delta(struct clock_event_device *dev)
+{
+	/* Nothing to do if we already reached the limit */
+	if (dev->min_delta_ns >= MIN_DELTA_LIMIT) {
+		printk_deferred(KERN_WARNING
+				"CE: Reprogramming failure. Giving up\n");
+		dev->next_event = KTIME_MAX;
+		return -ETIME;
+	}
+
+	if (dev->min_delta_ns < 5000)
+		dev->min_delta_ns = 5000;
+	else
+		dev->min_delta_ns += dev->min_delta_ns >> 1;
+
+	if (dev->min_delta_ns > MIN_DELTA_LIMIT)
+		dev->min_delta_ns = MIN_DELTA_LIMIT;
+
+	printk_deferred(KERN_WARNING
+			"CE: %s increased min_delta_ns to %llu nsec\n",
+			dev->name ? dev->name : "?",
+			(unsigned long long) dev->min_delta_ns);
+	return 0;
+}
+
+/**
+ * clockevents_program_min_delta - Set clock event device to the minimum delay.
+ * @dev:	device to program
+ *
+ * Returns 0 on success, -ETIME when the retry loop failed.
+ */
+static int clockevents_program_min_delta(struct clock_event_device *dev)
+{
+	unsigned long long clc;
+	int64_t delta;
+	int i;
+
+	for (i = 0;;) {
+		delta = dev->min_delta_ns;
+		dev->next_event = ktime_add_ns(ktime_get(), delta);
+
+		if (clockevent_state_shutdown(dev))
+			return 0;
+
+		dev->retries++;
+		clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+		if (dev->set_next_event((unsigned long) clc, dev) == 0)
+			return 0;
+
+		if (++i > 2) {
+			/*
+			 * We tried 3 times to program the device with the
+			 * given min_delta_ns. Try to increase the minimum
+			 * delta, if that fails as well get out of here.
+			 */
+			if (clockevents_increase_min_delta(dev))
+				return -ETIME;
+			i = 0;
+		}
+	}
+}
+
+#else  /* CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST */
+
+/**
+ * clockevents_program_min_delta - Set clock event device to the minimum delay.
+ * @dev:	device to program
+ *
+ * Returns 0 on success, -ETIME when the retry loop failed.
+ */
+static int clockevents_program_min_delta(struct clock_event_device *dev)
+{
+	unsigned long long clc;
+	int64_t delta = 0;
+	int i;
+
+	for (i = 0; i < 10; i++) {
+		delta += dev->min_delta_ns;
+		dev->next_event = ktime_add_ns(ktime_get(), delta);
+
+		if (clockevent_state_shutdown(dev))
+			return 0;
+
+		dev->retries++;
+		clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+		if (dev->set_next_event((unsigned long) clc, dev) == 0)
+			return 0;
+	}
+	return -ETIME;
+}
+
+#endif /* CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST */
+
+/**
+ * clockevents_program_event - Reprogram the clock event device.
+ * @dev:	device to program
+ * @expires:	absolute expiry time (monotonic clock)
+ * @force:	program minimum delay if expires can not be set
+ *
+ * Returns 0 on success, -ETIME when the event is in the past.
+ */
+int clockevents_program_event(struct clock_event_device *dev, ktime_t expires,
+			      bool force)
+{
+	unsigned long long clc;
+	int64_t delta;
+	int rc;
+
+	if (WARN_ON_ONCE(expires < 0))
+		return -ETIME;
+
+	dev->next_event = expires;
+
+	if (clockevent_state_shutdown(dev))
+		return 0;
+
+	/* We must be in ONESHOT state here */
+	WARN_ONCE(!clockevent_state_oneshot(dev), "Current state: %d\n",
+		  clockevent_get_state(dev));
+
+	/* Shortcut for clockevent devices that can deal with ktime. */
+	if (dev->features & CLOCK_EVT_FEAT_KTIME)
+		return dev->set_next_ktime(expires, dev);
+
+	delta = ktime_to_ns(ktime_sub(expires, ktime_get()));
+	if (delta <= 0)
+		return force ? clockevents_program_min_delta(dev) : -ETIME;
+
+	delta = min(delta, (int64_t) dev->max_delta_ns);
+	delta = max(delta, (int64_t) dev->min_delta_ns);
+
+	clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+	rc = dev->set_next_event((unsigned long) clc, dev);
+
+	return (rc && force) ? clockevents_program_min_delta(dev) : rc;
+}
+
+/*
+ * Called after a clockevent has been added which might
+ * have replaced a current regular or broadcast device. A
+ * released normal device might be a suitable replacement
+ * for the current broadcast device. Similarly a released
+ * broadcast device might be a suitable replacement for a
+ * normal device.
+ */
+static void clockevents_notify_released(void)
+{
+	struct clock_event_device *dev;
+
+	/*
+	 * Keep iterating as long as tick_check_new_device()
+	 * replaces a device.
+	 */
+	while (!list_empty(&clockevents_released)) {
+		dev = list_entry(clockevents_released.next,
+				 struct clock_event_device, list);
+		list_move(&dev->list, &clockevent_devices);
+		tick_check_new_device(dev);
+	}
+}
+
+/*
+ * Try to install a replacement clock event device
+ */
+static int clockevents_replace(struct clock_event_device *ced)
+{
+	struct clock_event_device *dev, *newdev = NULL;
+
+	list_for_each_entry(dev, &clockevent_devices, list) {
+		if (dev == ced || !clockevent_state_detached(dev))
+			continue;
+
+		if (!tick_check_replacement(newdev, dev))
+			continue;
+
+		if (!try_module_get(dev->owner))
+			continue;
+
+		if (newdev)
+			module_put(newdev->owner);
+		newdev = dev;
+	}
+	if (newdev) {
+		tick_install_replacement(newdev);
+		list_del_init(&ced->list);
+	}
+	return newdev ? 0 : -EBUSY;
+}
+
+/*
+ * Called with clockevents_mutex and clockevents_lock held
+ */
+static int __clockevents_try_unbind(struct clock_event_device *ced, int cpu)
+{
+	/* Fast track. Device is unused */
+	if (clockevent_state_detached(ced)) {
+		list_del_init(&ced->list);
+		return 0;
+	}
+
+	return ced == per_cpu(tick_cpu_device, cpu).evtdev ? -EAGAIN : -EBUSY;
+}
+
+/*
+ * SMP function call to unbind a device
+ */
+static void __clockevents_unbind(void *arg)
+{
+	struct ce_unbind *cu = arg;
+	int res;
+
+	raw_spin_lock(&clockevents_lock);
+	res = __clockevents_try_unbind(cu->ce, smp_processor_id());
+	if (res == -EAGAIN)
+		res = clockevents_replace(cu->ce);
+	cu->res = res;
+	raw_spin_unlock(&clockevents_lock);
+}
+
+/*
+ * Issues smp function call to unbind a per cpu device. Called with
+ * clockevents_mutex held.
+ */
+static int clockevents_unbind(struct clock_event_device *ced, int cpu)
+{
+	struct ce_unbind cu = { .ce = ced, .res = -ENODEV };
+
+	smp_call_function_single(cpu, __clockevents_unbind, &cu, 1);
+	return cu.res;
+}
+
+/*
+ * Unbind a clockevents device.
+ */
+int clockevents_unbind_device(struct clock_event_device *ced, int cpu)
+{
+	int ret;
+
+	mutex_lock(&clockevents_mutex);
+	ret = clockevents_unbind(ced, cpu);
+	mutex_unlock(&clockevents_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(clockevents_unbind_device);
+
+/**
+ * clockevents_register_device - register a clock event device
+ * @dev:	device to register
+ */
+void clockevents_register_device(struct clock_event_device *dev)
+{
+	unsigned long flags;
+
+	/* Initialize state to DETACHED */
+	clockevent_set_state(dev, CLOCK_EVT_STATE_DETACHED);
+
+	if (!dev->cpumask) {
+		WARN_ON(num_possible_cpus() > 1);
+		dev->cpumask = cpumask_of(smp_processor_id());
+	}
+
+	if (dev->cpumask == cpu_all_mask) {
+		WARN(1, "%s cpumask == cpu_all_mask, using cpu_possible_mask instead\n",
+		     dev->name);
+		dev->cpumask = cpu_possible_mask;
+	}
+
+	raw_spin_lock_irqsave(&clockevents_lock, flags);
+
+	list_add(&dev->list, &clockevent_devices);
+	tick_check_new_device(dev);
+	clockevents_notify_released();
+
+	raw_spin_unlock_irqrestore(&clockevents_lock, flags);
+}
+EXPORT_SYMBOL_GPL(clockevents_register_device);
+
+static void clockevents_config(struct clock_event_device *dev, u32 freq)
+{
+	u64 sec;
+
+	if (!(dev->features & CLOCK_EVT_FEAT_ONESHOT))
+		return;
+
+	/*
+	 * Calculate the maximum number of seconds we can sleep. Limit
+	 * to 10 minutes for hardware which can program more than
+	 * 32bit ticks so we still get reasonable conversion values.
+	 */
+	sec = dev->max_delta_ticks;
+	do_div(sec, freq);
+	if (!sec)
+		sec = 1;
+	else if (sec > 600 && dev->max_delta_ticks > UINT_MAX)
+		sec = 600;
+
+	clockevents_calc_mult_shift(dev, freq, sec);
+	dev->min_delta_ns = cev_delta2ns(dev->min_delta_ticks, dev, false);
+	dev->max_delta_ns = cev_delta2ns(dev->max_delta_ticks, dev, true);
+}
+
+/**
+ * clockevents_config_and_register - Configure and register a clock event device
+ * @dev:	device to register
+ * @freq:	The clock frequency
+ * @min_delta:	The minimum clock ticks to program in oneshot mode
+ * @max_delta:	The maximum clock ticks to program in oneshot mode
+ *
+ * min/max_delta can be 0 for devices which do not support oneshot mode.
+ */
+void clockevents_config_and_register(struct clock_event_device *dev,
+				     u32 freq, unsigned long min_delta,
+				     unsigned long max_delta)
+{
+	dev->min_delta_ticks = min_delta;
+	dev->max_delta_ticks = max_delta;
+	clockevents_config(dev, freq);
+	clockevents_register_device(dev);
+}
+EXPORT_SYMBOL_GPL(clockevents_config_and_register);
+
+int __clockevents_update_freq(struct clock_event_device *dev, u32 freq)
+{
+	clockevents_config(dev, freq);
+
+	if (clockevent_state_oneshot(dev))
+		return clockevents_program_event(dev, dev->next_event, false);
+
+	if (clockevent_state_periodic(dev))
+		return __clockevents_switch_state(dev, CLOCK_EVT_STATE_PERIODIC);
+
+	return 0;
+}
+
+/**
+ * clockevents_update_freq - Update frequency and reprogram a clock event device.
+ * @dev:	device to modify
+ * @freq:	new device frequency
+ *
+ * Reconfigure and reprogram a clock event device in oneshot
+ * mode. Must be called on the cpu for which the device delivers per
+ * cpu timer events. If called for the broadcast device the core takes
+ * care of serialization.
+ *
+ * Returns 0 on success, -ETIME when the event is in the past.
+ */
+int clockevents_update_freq(struct clock_event_device *dev, u32 freq)
+{
+	unsigned long flags;
+	int ret;
+
+	local_irq_save(flags);
+	ret = tick_broadcast_update_freq(dev, freq);
+	if (ret == -ENODEV)
+		ret = __clockevents_update_freq(dev, freq);
+	local_irq_restore(flags);
+	return ret;
+}
+
+/*
+ * Noop handler when we shut down an event device
+ */
+void clockevents_handle_noop(struct clock_event_device *dev)
+{
+}
+
+/**
+ * clockevents_exchange_device - release and request clock devices
+ * @old:	device to release (can be NULL)
+ * @new:	device to request (can be NULL)
+ *
+ * Called from various tick functions with clockevents_lock held and
+ * interrupts disabled.
+ */
+void clockevents_exchange_device(struct clock_event_device *old,
+				 struct clock_event_device *new)
+{
+	/*
+	 * Caller releases a clock event device. We queue it into the
+	 * released list and do a notify add later.
+	 */
+	if (old) {
+		module_put(old->owner);
+		clockevents_switch_state(old, CLOCK_EVT_STATE_DETACHED);
+		list_move(&old->list, &clockevents_released);
+	}
+
+	if (new) {
+		BUG_ON(!clockevent_state_detached(new));
+		clockevents_shutdown(new);
+	}
+}
+
+/**
+ * clockevents_suspend - suspend clock devices
+ */
+void clockevents_suspend(void)
+{
+	struct clock_event_device *dev;
+
+	list_for_each_entry_reverse(dev, &clockevent_devices, list)
+		if (dev->suspend && !clockevent_state_detached(dev))
+			dev->suspend(dev);
+}
+
+/**
+ * clockevents_resume - resume clock devices
+ */
+void clockevents_resume(void)
+{
+	struct clock_event_device *dev;
+
+	list_for_each_entry(dev, &clockevent_devices, list)
+		if (dev->resume && !clockevent_state_detached(dev))
+			dev->resume(dev);
+}
+
+#ifdef CONFIG_HOTPLUG_CPU
+
+/**
+ * tick_offline_cpu - Shutdown all clock events related
+ *                    to this CPU and take it out of the
+ *                    broadcast mechanism.
+ * @cpu:	The outgoing CPU
+ *
+ * Called by the dying CPU during teardown.
+ */
+void tick_offline_cpu(unsigned int cpu)
+{
+	struct clock_event_device *dev, *tmp;
+
+	raw_spin_lock(&clockevents_lock);
+
+	tick_broadcast_offline(cpu);
+	tick_shutdown();
+
+	/*
+	 * Unregister the clock event devices which were
+	 * released above.
+	 */
+	list_for_each_entry_safe(dev, tmp, &clockevents_released, list)
+		list_del(&dev->list);
+
+	/*
+	 * Now check whether the CPU has left unused per cpu devices
+	 */
+	list_for_each_entry_safe(dev, tmp, &clockevent_devices, list) {
+		if (cpumask_test_cpu(cpu, dev->cpumask) &&
+		    cpumask_weight(dev->cpumask) == 1 &&
+		    !tick_is_broadcast_device(dev)) {
+			BUG_ON(!clockevent_state_detached(dev));
+			list_del(&dev->list);
+		}
+	}
+
+	raw_spin_unlock(&clockevents_lock);
+}
+#endif
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Clocksource watchdog unit test");
+MODULE_AUTHOR("Paul E. McKenney <paulmck@kernel.org>");
+
+static int holdoff = IS_BUILTIN(CONFIG_TEST_CLOCKSOURCE_WATCHDOG) ? 10 : 0;
+module_param(holdoff, int, 0444);
+MODULE_PARM_DESC(holdoff, "Time to wait to start test (s).");
+
+/* Watchdog kthread's task_struct pointer for debug purposes. */
+static struct task_struct *wdtest_task;
+
+static u64 wdtest_jiffies_read(struct clocksource *cs)
+{
+	return (u64)jiffies;
+}
+
+static struct clocksource clocksource_wdtest_jiffies = {
+	.name			= "wdtest-jiffies",
+	.rating			= 1, /* lowest valid rating*/
+	.uncertainty_margin	= TICK_NSEC,
+	.read			= wdtest_jiffies_read,
+	.mask			= CLOCKSOURCE_MASK(32),
+	.flags			= CLOCK_SOURCE_MUST_VERIFY,
+	.mult			= TICK_NSEC << JIFFIES_SHIFT, /* details above */
+	.shift			= JIFFIES_SHIFT,
+	.max_cycles		= 10,
+};
+
+static int wdtest_ktime_read_ndelays;
+static bool wdtest_ktime_read_fuzz;
+
+static u64 wdtest_ktime_read(struct clocksource *cs)
+{
+	int wkrn = READ_ONCE(wdtest_ktime_read_ndelays);
+	static int sign = 1;
+	u64 ret;
+
+	if (wkrn) {
+		udelay(cs->uncertainty_margin / 250);
+		WRITE_ONCE(wdtest_ktime_read_ndelays, wkrn - 1);
+	}
+	ret = ktime_get_real_fast_ns();
+	if (READ_ONCE(wdtest_ktime_read_fuzz)) {
+		sign = -sign;
+		ret = ret + sign * 100 * NSEC_PER_MSEC;
+	}
+	return ret;
+}
+
+static void wdtest_ktime_cs_mark_unstable(struct clocksource *cs)
+{
+	pr_info("--- Marking %s unstable due to clocksource watchdog.\n", cs->name);
+}
+
+#define KTIME_FLAGS (CLOCK_SOURCE_IS_CONTINUOUS | \
+		     CLOCK_SOURCE_VALID_FOR_HRES | \
+		     CLOCK_SOURCE_MUST_VERIFY | \
+		     CLOCK_SOURCE_VERIFY_PERCPU)
+
+static struct clocksource clocksource_wdtest_ktime = {
+	.name			= "wdtest-ktime",
+	.rating			= 300,
+	.read			= wdtest_ktime_read,
+	.mask			= CLOCKSOURCE_MASK(64),
+	.flags			= KTIME_FLAGS,
+	.mark_unstable		= wdtest_ktime_cs_mark_unstable,
+	.list			= LIST_HEAD_INIT(clocksource_wdtest_ktime.list),
+};
+
+/* Reset the clocksource if needed. */
+static void wdtest_ktime_clocksource_reset(void)
+{
+	if (clocksource_wdtest_ktime.flags & CLOCK_SOURCE_UNSTABLE) {
+		clocksource_unregister(&clocksource_wdtest_ktime);
+		clocksource_wdtest_ktime.flags = KTIME_FLAGS;
+		schedule_timeout_uninterruptible(HZ / 10);
+		clocksource_register_khz(&clocksource_wdtest_ktime, 1000 * 1000);
+	}
+}
+
+/* Run the specified series of watchdog tests. */
+static int wdtest_func(void *arg)
+{
+	unsigned long j1, j2;
+	int i, max_retries;
+	char *s;
+
+	schedule_timeout_uninterruptible(holdoff * HZ);
+
+	/*
+	 * Verify that jiffies-like clocksources get the manually
+	 * specified uncertainty margin.
+	 */
+	pr_info("--- Verify jiffies-like uncertainty margin.\n");
+	__clocksource_register(&clocksource_wdtest_jiffies);
+	WARN_ON_ONCE(clocksource_wdtest_jiffies.uncertainty_margin != TICK_NSEC);
+
+	j1 = clocksource_wdtest_jiffies.read(&clocksource_wdtest_jiffies);
+	schedule_timeout_uninterruptible(HZ);
+	j2 = clocksource_wdtest_jiffies.read(&clocksource_wdtest_jiffies);
+	WARN_ON_ONCE(j1 == j2);
+
+	clocksource_unregister(&clocksource_wdtest_jiffies);
+
+	/*
+	 * Verify that tsc-like clocksources are assigned a reasonable
+	 * uncertainty margin.
+	 */
+	pr_info("--- Verify tsc-like uncertainty margin.\n");
+	clocksource_register_khz(&clocksource_wdtest_ktime, 1000 * 1000);
+	WARN_ON_ONCE(clocksource_wdtest_ktime.uncertainty_margin < NSEC_PER_USEC);
+
+	j1 = clocksource_wdtest_ktime.read(&clocksource_wdtest_ktime);
+	udelay(1);
+	j2 = clocksource_wdtest_ktime.read(&clocksource_wdtest_ktime);
+	pr_info("--- tsc-like times: %lu - %lu = %lu.\n", j2, j1, j2 - j1);
+	WARN_ONCE(time_before(j2, j1 + NSEC_PER_USEC),
+		  "Expected at least 1000ns, got %lu.\n", j2 - j1);
+
+	/* Verify tsc-like stability with various numbers of errors injected. */
+	max_retries = clocksource_get_max_watchdog_retry();
+	for (i = 0; i <= max_retries + 1; i++) {
+		if (i <= 1 && i < max_retries)
+			s = "";
+		else if (i <= max_retries)
+			s = ", expect message";
+		else
+			s = ", expect clock skew";
+		pr_info("--- Watchdog with %dx error injection, %d retries%s.\n", i, max_retries, s);
+		WRITE_ONCE(wdtest_ktime_read_ndelays, i);
+		schedule_timeout_uninterruptible(2 * HZ);
+		WARN_ON_ONCE(READ_ONCE(wdtest_ktime_read_ndelays));
+		WARN_ON_ONCE((i <= max_retries) !=
+			     !(clocksource_wdtest_ktime.flags & CLOCK_SOURCE_UNSTABLE));
+		wdtest_ktime_clocksource_reset();
+	}
+
+	/* Verify tsc-like stability with clock-value-fuzz error injection. */
+	pr_info("--- Watchdog clock-value-fuzz error injection, expect clock skew and per-CPU mismatches.\n");
+	WRITE_ONCE(wdtest_ktime_read_fuzz, true);
+	schedule_timeout_uninterruptible(2 * HZ);
+	WARN_ON_ONCE(!(clocksource_wdtest_ktime.flags & CLOCK_SOURCE_UNSTABLE));
+	clocksource_verify_percpu(&clocksource_wdtest_ktime);
+	WRITE_ONCE(wdtest_ktime_read_fuzz, false);
+
+	clocksource_unregister(&clocksource_wdtest_ktime);
+
+	pr_info("--- Done with test.\n");
+	return 0;
+}
+
+static void wdtest_print_module_parms(void)
+{
+	pr_alert("--- holdoff=%d\n", holdoff);
+}
+
+/* Cleanup function. */
+static void clocksource_wdtest_cleanup(void)
+{
+}
+
+static int __init clocksource_wdtest_init(void)
+{
+	int ret = 0;
+
+	wdtest_print_module_parms();
+
+	/* Create watchdog-test task. */
+	wdtest_task = kthread_run(wdtest_func, NULL, "wdtest");
+	if (IS_ERR(wdtest_task)) {
+		ret = PTR_ERR(wdtest_task);
+		pr_warn("%s: Failed to create wdtest kthread.\n", __func__);
+		wdtest_task = NULL;
+		return ret;
+	}
+
+	return 0;
+}
+
+module_init(clocksource_wdtest_init);
+module_exit(clocksource_wdtest_cleanup);
+
+static void clocksource_enqueue(struct clocksource *cs);
+
+static noinline u64 cycles_to_nsec_safe(struct clocksource *cs, u64 start, u64 end)
+{
+	u64 delta = clocksource_delta(end, start, cs->mask, cs->max_raw_delta);
+
+	if (likely(delta < cs->max_cycles))
+		return clocksource_cyc2ns(delta, cs->mult, cs->shift);
+
+	return mul_u64_u32_shr(delta, cs->mult, cs->shift);
+}
+
+/**
+ * clocks_calc_mult_shift - calculate mult/shift factors for scaled math of clocks
+ * @mult:	pointer to mult variable
+ * @shift:	pointer to shift variable
+ * @from:	frequency to convert from
+ * @to:		frequency to convert to
+ * @maxsec:	guaranteed runtime conversion range in seconds
+ *
+ * The function evaluates the shift/mult pair for the scaled math
+ * operations of clocksources and clockevents.
+ *
+ * @to and @from are frequency values in HZ. For clock sources @to is
+ * NSEC_PER_SEC == 1GHz and @from is the counter frequency. For clock
+ * event @to is the counter frequency and @from is NSEC_PER_SEC.
+ *
+ * The @maxsec conversion range argument controls the time frame in
+ * seconds which must be covered by the runtime conversion with the
+ * calculated mult and shift factors. This guarantees that no 64bit
+ * overflow happens when the input value of the conversion is
+ * multiplied with the calculated mult factor. Larger ranges may
+ * reduce the conversion accuracy by choosing smaller mult and shift
+ * factors.
+ */
+void
+clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 maxsec)
+{
+	u64 tmp;
+	u32 sft, sftacc= 32;
+
+	/*
+	 * Calculate the shift factor which is limiting the conversion
+	 * range:
+	 */
+	tmp = ((u64)maxsec * from) >> 32;
+	while (tmp) {
+		tmp >>=1;
+		sftacc--;
+	}
+
+	/*
+	 * Find the conversion shift/mult pair which has the best
+	 * accuracy and fits the maxsec conversion range:
+	 */
+	for (sft = 32; sft > 0; sft--) {
+		tmp = (u64) to << sft;
+		tmp += from / 2;
+		do_div(tmp, from);
+		if ((tmp >> sftacc) == 0)
+			break;
+	}
+	*mult = tmp;
+	*shift = sft;
+}
+EXPORT_SYMBOL_GPL(clocks_calc_mult_shift);
+
+/*[Clocksource internal variables]---------
+ * curr_clocksource:
+ *	currently selected clocksource.
+ * suspend_clocksource:
+ *	used to calculate the suspend time.
+ * clocksource_list:
+ *	linked list with the registered clocksources
+ * clocksource_mutex:
+ *	protects manipulations to curr_clocksource and the clocksource_list
+ * override_name:
+ *	Name of the user-specified clocksource.
+ */
+static struct clocksource *curr_clocksource;
+static struct clocksource *suspend_clocksource;
+static LIST_HEAD(clocksource_list);
+static DEFINE_MUTEX(clocksource_mutex);
+static char override_name[CS_NAME_LEN];
+static int finished_booting;
+static u64 suspend_start;
+
+/*
+ * Interval: 0.5sec.
+ */
+#define WATCHDOG_INTERVAL (HZ >> 1)
+#define WATCHDOG_INTERVAL_MAX_NS ((2 * WATCHDOG_INTERVAL) * (NSEC_PER_SEC / HZ))
+
+/*
+ * Threshold: 0.0312s, when doubled: 0.0625s.
+ */
+#define WATCHDOG_THRESHOLD (NSEC_PER_SEC >> 5)
+
+/*
+ * Maximum permissible delay between two readouts of the watchdog
+ * clocksource surrounding a read of the clocksource being validated.
+ * This delay could be due to SMIs, NMIs, or to VCPU preemptions.  Used as
+ * a lower bound for cs->uncertainty_margin values when registering clocks.
+ *
+ * The default of 500 parts per million is based on NTP's limits.
+ * If a clocksource is good enough for NTP, it is good enough for us!
+ *
+ * In other words, by default, even if a clocksource is extremely
+ * precise (for example, with a sub-nanosecond period), the maximum
+ * permissible skew between the clocksource watchdog and the clocksource
+ * under test is not permitted to go below the 500ppm minimum defined
+ * by MAX_SKEW_USEC.  This 500ppm minimum may be overridden using the
+ * CLOCKSOURCE_WATCHDOG_MAX_SKEW_US Kconfig option.
+ */
+#ifdef CONFIG_CLOCKSOURCE_WATCHDOG_MAX_SKEW_US
+#define MAX_SKEW_USEC	CONFIG_CLOCKSOURCE_WATCHDOG_MAX_SKEW_US
+#else
+#define MAX_SKEW_USEC	(125 * WATCHDOG_INTERVAL / HZ)
+#endif
+
+/*
+ * Default for maximum permissible skew when cs->uncertainty_margin is
+ * not specified, and the lower bound even when cs->uncertainty_margin
+ * is specified.  This is also the default that is used when registering
+ * clocks with unspecified cs->uncertainty_margin, so this macro is used
+ * even in CONFIG_CLOCKSOURCE_WATCHDOG=n kernels.
+ */
+#define WATCHDOG_MAX_SKEW (MAX_SKEW_USEC * NSEC_PER_USEC)
+
+#ifdef CONFIG_CLOCKSOURCE_WATCHDOG
+static void clocksource_watchdog_work(struct work_struct *work);
+static void clocksource_select(void);
+
+static LIST_HEAD(watchdog_list);
+static struct clocksource *watchdog;
+static struct timer_list watchdog_timer;
+static DECLARE_WORK(watchdog_work, clocksource_watchdog_work);
+static DEFINE_SPINLOCK(watchdog_lock);
+static int watchdog_running;
+static atomic_t watchdog_reset_pending;
+static int64_t watchdog_max_interval;
+
+static inline void clocksource_watchdog_lock(unsigned long *flags)
+{
+	spin_lock_irqsave(&watchdog_lock, *flags);
+}
+
+static inline void clocksource_watchdog_unlock(unsigned long *flags)
+{
+	spin_unlock_irqrestore(&watchdog_lock, *flags);
+}
+
+static int clocksource_watchdog_kthread(void *data);
+
+static void clocksource_watchdog_work(struct work_struct *work)
+{
+	/*
+	 * We cannot directly run clocksource_watchdog_kthread() here, because
+	 * clocksource_select() calls timekeeping_notify() which uses
+	 * stop_machine(). One cannot use stop_machine() from a workqueue() due
+	 * lock inversions wrt CPU hotplug.
+	 *
+	 * Also, we only ever run this work once or twice during the lifetime
+	 * of the kernel, so there is no point in creating a more permanent
+	 * kthread for this.
+	 *
+	 * If kthread_run fails the next watchdog scan over the
+	 * watchdog_list will find the unstable clock again.
+	 */
+	kthread_run(clocksource_watchdog_kthread, NULL, "kwatchdog");
+}
+
+static void clocksource_change_rating(struct clocksource *cs, int rating)
+{
+	list_del(&cs->list);
+	cs->rating = rating;
+	clocksource_enqueue(cs);
+}
+
+static void __clocksource_unstable(struct clocksource *cs)
+{
+	cs->flags &= ~(CLOCK_SOURCE_VALID_FOR_HRES | CLOCK_SOURCE_WATCHDOG);
+	cs->flags |= CLOCK_SOURCE_UNSTABLE;
+
+	/*
+	 * If the clocksource is registered clocksource_watchdog_kthread() will
+	 * re-rate and re-select.
+	 */
+	if (list_empty(&cs->list)) {
+		cs->rating = 0;
+		return;
+	}
+
+	if (cs->mark_unstable)
+		cs->mark_unstable(cs);
+
+	/* kick clocksource_watchdog_kthread() */
+	if (finished_booting)
+		schedule_work(&watchdog_work);
+}
+
+/**
+ * clocksource_mark_unstable - mark clocksource unstable via watchdog
+ * @cs:		clocksource to be marked unstable
+ *
+ * This function is called by the x86 TSC code to mark clocksources as unstable;
+ * it defers demotion and re-selection to a kthread.
+ */
+void clocksource_mark_unstable(struct clocksource *cs)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&watchdog_lock, flags);
+	if (!(cs->flags & CLOCK_SOURCE_UNSTABLE)) {
+		if (!list_empty(&cs->list) && list_empty(&cs->wd_list))
+			list_add(&cs->wd_list, &watchdog_list);
+		__clocksource_unstable(cs);
+	}
+	spin_unlock_irqrestore(&watchdog_lock, flags);
+}
+
+static int verify_n_cpus = 8;
+module_param(verify_n_cpus, int, 0644);
+
+enum wd_read_status {
+	WD_READ_SUCCESS,
+	WD_READ_UNSTABLE,
+	WD_READ_SKIP
+};
+
+static enum wd_read_status cs_watchdog_read(struct clocksource *cs, u64 *csnow, u64 *wdnow)
+{
+	int64_t md = watchdog->uncertainty_margin;
+	unsigned int nretries, max_retries;
+	int64_t wd_delay, wd_seq_delay;
+	u64 wd_end, wd_end2;
+
+	max_retries = clocksource_get_max_watchdog_retry();
+	for (nretries = 0; nretries <= max_retries; nretries++) {
+		local_irq_disable();
+		*wdnow = watchdog->read(watchdog);
+		*csnow = cs->read(cs);
+		wd_end = watchdog->read(watchdog);
+		wd_end2 = watchdog->read(watchdog);
+		local_irq_enable();
+
+		wd_delay = cycles_to_nsec_safe(watchdog, *wdnow, wd_end);
+		if (wd_delay <= md + cs->uncertainty_margin) {
+			if (nretries > 1 && nretries >= max_retries) {
+				pr_warn("timekeeping watchdog on CPU%d: %s retried %d times before success\n",
+					smp_processor_id(), watchdog->name, nretries);
+			}
+			return WD_READ_SUCCESS;
+		}
+
+		/*
+		 * Now compute delay in consecutive watchdog read to see if
+		 * there is too much external interferences that cause
+		 * significant delay in reading both clocksource and watchdog.
+		 *
+		 * If consecutive WD read-back delay > md, report
+		 * system busy, reinit the watchdog and skip the current
+		 * watchdog test.
+		 */
+		wd_seq_delay = cycles_to_nsec_safe(watchdog, wd_end, wd_end2);
+		if (wd_seq_delay > md)
+			goto skip_test;
+	}
+
+	pr_warn("timekeeping watchdog on CPU%d: wd-%s-wd excessive read-back delay of %lldns vs. limit of %ldns, wd-wd read-back delay only %lldns, attempt %d, marking %s unstable\n",
+		smp_processor_id(), cs->name, wd_delay, WATCHDOG_MAX_SKEW, wd_seq_delay, nretries, cs->name);
+	return WD_READ_UNSTABLE;
+
+skip_test:
+	pr_info("timekeeping watchdog on CPU%d: %s wd-wd read-back delay of %lldns\n",
+		smp_processor_id(), watchdog->name, wd_seq_delay);
+	pr_info("wd-%s-wd read-back delay of %lldns, clock-skew test skipped!\n",
+		cs->name, wd_delay);
+	return WD_READ_SKIP;
+}
+
+static u64 csnow_mid;
+static cpumask_t cpus_ahead;
+static cpumask_t cpus_behind;
+static cpumask_t cpus_chosen;
+
+static void clocksource_verify_choose_cpus(void)
+{
+	int cpu, i, n = verify_n_cpus;
+
+	if (n < 0 || n >= num_online_cpus()) {
+		/* Check all of the CPUs. */
+		cpumask_copy(&cpus_chosen, cpu_online_mask);
+		cpumask_clear_cpu(smp_processor_id(), &cpus_chosen);
+		return;
+	}
+
+	/* If no checking desired, or no other CPU to check, leave. */
+	cpumask_clear(&cpus_chosen);
+	if (n == 0 || num_online_cpus() <= 1)
+		return;
+
+	/* Make sure to select at least one CPU other than the current CPU. */
+	cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
+	if (WARN_ON_ONCE(cpu >= nr_cpu_ids))
+		return;
+	cpumask_set_cpu(cpu, &cpus_chosen);
+
+	/* Force a sane value for the boot parameter. */
+	if (n > nr_cpu_ids)
+		n = nr_cpu_ids;
+
+	/*
+	 * Randomly select the specified number of CPUs.  If the same
+	 * CPU is selected multiple times, that CPU is checked only once,
+	 * and no replacement CPU is selected.  This gracefully handles
+	 * situations where verify_n_cpus is greater than the number of
+	 * CPUs that are currently online.
+	 */
+	for (i = 1; i < n; i++) {
+		cpu = cpumask_random(cpu_online_mask);
+		if (!WARN_ON_ONCE(cpu >= nr_cpu_ids))
+			cpumask_set_cpu(cpu, &cpus_chosen);
+	}
+
+	/* Don't verify ourselves. */
+	cpumask_clear_cpu(smp_processor_id(), &cpus_chosen);
+}
+
+static void clocksource_verify_one_cpu(void *csin)
+{
+	struct clocksource *cs = (struct clocksource *)csin;
+
+	csnow_mid = cs->read(cs);
+}
+
+void clocksource_verify_percpu(struct clocksource *cs)
+{
+	int64_t cs_nsec, cs_nsec_max = 0, cs_nsec_min = LLONG_MAX;
+	u64 csnow_begin, csnow_end;
+	int cpu, testcpu;
+	s64 delta;
+
+	if (verify_n_cpus == 0)
+		return;
+	cpumask_clear(&cpus_ahead);
+	cpumask_clear(&cpus_behind);
+	cpus_read_lock();
+	migrate_disable();
+	clocksource_verify_choose_cpus();
+	if (cpumask_empty(&cpus_chosen)) {
+		migrate_enable();
+		cpus_read_unlock();
+		pr_warn("Not enough CPUs to check clocksource '%s'.\n", cs->name);
+		return;
+	}
+	testcpu = smp_processor_id();
+	pr_info("Checking clocksource %s synchronization from CPU %d to CPUs %*pbl.\n",
+		cs->name, testcpu, cpumask_pr_args(&cpus_chosen));
+	preempt_disable();
+	for_each_cpu(cpu, &cpus_chosen) {
+		if (cpu == testcpu)
+			continue;
+		csnow_begin = cs->read(cs);
+		smp_call_function_single(cpu, clocksource_verify_one_cpu, cs, 1);
+		csnow_end = cs->read(cs);
+		delta = (s64)((csnow_mid - csnow_begin) & cs->mask);
+		if (delta < 0)
+			cpumask_set_cpu(cpu, &cpus_behind);
+		delta = (csnow_end - csnow_mid) & cs->mask;
+		if (delta < 0)
+			cpumask_set_cpu(cpu, &cpus_ahead);
+		cs_nsec = cycles_to_nsec_safe(cs, csnow_begin, csnow_end);
+		if (cs_nsec > cs_nsec_max)
+			cs_nsec_max = cs_nsec;
+		if (cs_nsec < cs_nsec_min)
+			cs_nsec_min = cs_nsec;
+	}
+	preempt_enable();
+	migrate_enable();
+	cpus_read_unlock();
+	if (!cpumask_empty(&cpus_ahead))
+		pr_warn("        CPUs %*pbl ahead of CPU %d for clocksource %s.\n",
+			cpumask_pr_args(&cpus_ahead), testcpu, cs->name);
+	if (!cpumask_empty(&cpus_behind))
+		pr_warn("        CPUs %*pbl behind CPU %d for clocksource %s.\n",
+			cpumask_pr_args(&cpus_behind), testcpu, cs->name);
+	pr_info("        CPU %d check durations %lldns - %lldns for clocksource %s.\n",
+		testcpu, cs_nsec_min, cs_nsec_max, cs->name);
+}
+EXPORT_SYMBOL_GPL(clocksource_verify_percpu);
+
+static inline void clocksource_reset_watchdog(void)
+{
+	struct clocksource *cs;
+
+	list_for_each_entry(cs, &watchdog_list, wd_list)
+		cs->flags &= ~CLOCK_SOURCE_WATCHDOG;
+}
+
+
+static void clocksource_watchdog(struct timer_list *unused)
+{
+	int64_t wd_nsec, cs_nsec, interval;
+	u64 csnow, wdnow, cslast, wdlast;
+	int next_cpu, reset_pending;
+	struct clocksource *cs;
+	enum wd_read_status read_ret;
+	unsigned long extra_wait = 0;
+	u32 md;
+
+	spin_lock(&watchdog_lock);
+	if (!watchdog_running)
+		goto out;
+
+	reset_pending = atomic_read(&watchdog_reset_pending);
+
+	list_for_each_entry(cs, &watchdog_list, wd_list) {
+
+		/* Clocksource already marked unstable? */
+		if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
+			if (finished_booting)
+				schedule_work(&watchdog_work);
+			continue;
+		}
+
+		read_ret = cs_watchdog_read(cs, &csnow, &wdnow);
+
+		if (read_ret == WD_READ_UNSTABLE) {
+			/* Clock readout unreliable, so give it up. */
+			__clocksource_unstable(cs);
+			continue;
+		}
+
+		/*
+		 * When WD_READ_SKIP is returned, it means the system is likely
+		 * under very heavy load, where the latency of reading
+		 * watchdog/clocksource is very big, and affect the accuracy of
+		 * watchdog check. So give system some space and suspend the
+		 * watchdog check for 5 minutes.
+		 */
+		if (read_ret == WD_READ_SKIP) {
+			/*
+			 * As the watchdog timer will be suspended, and
+			 * cs->last could keep unchanged for 5 minutes, reset
+			 * the counters.
+			 */
+			clocksource_reset_watchdog();
+			extra_wait = HZ * 300;
+			break;
+		}
+
+		/* Clocksource initialized ? */
+		if (!(cs->flags & CLOCK_SOURCE_WATCHDOG) ||
+		    atomic_read(&watchdog_reset_pending)) {
+			cs->flags |= CLOCK_SOURCE_WATCHDOG;
+			cs->wd_last = wdnow;
+			cs->cs_last = csnow;
+			continue;
+		}
+
+		wd_nsec = cycles_to_nsec_safe(watchdog, cs->wd_last, wdnow);
+		cs_nsec = cycles_to_nsec_safe(cs, cs->cs_last, csnow);
+		wdlast = cs->wd_last; /* save these in case we print them */
+		cslast = cs->cs_last;
+		cs->cs_last = csnow;
+		cs->wd_last = wdnow;
+
+		if (atomic_read(&watchdog_reset_pending))
+			continue;
+
+		/*
+		 * The processing of timer softirqs can get delayed (usually
+		 * on account of ksoftirqd not getting to run in a timely
+		 * manner), which causes the watchdog interval to stretch.
+		 * Skew detection may fail for longer watchdog intervals
+		 * on account of fixed margins being used.
+		 * Some clocksources, e.g. acpi_pm, cannot tolerate
+		 * watchdog intervals longer than a few seconds.
+		 */
+		interval = max(cs_nsec, wd_nsec);
+		if (unlikely(interval > WATCHDOG_INTERVAL_MAX_NS)) {
+			if (system_state > SYSTEM_SCHEDULING &&
+			    interval > 2 * watchdog_max_interval) {
+				watchdog_max_interval = interval;
+				pr_warn("Long readout interval, skipping watchdog check: cs_nsec: %lld wd_nsec: %lld\n",
+					cs_nsec, wd_nsec);
+			}
+			watchdog_timer.expires = jiffies;
+			continue;
+		}
+
+		/* Check the deviation from the watchdog clocksource. */
+		md = cs->uncertainty_margin + watchdog->uncertainty_margin;
+		if (abs(cs_nsec - wd_nsec) > md) {
+			s64 cs_wd_msec;
+			s64 wd_msec;
+			u32 wd_rem;
+
+			pr_warn("timekeeping watchdog on CPU%d: Marking clocksource '%s' as unstable because the skew is too large:\n",
+				smp_processor_id(), cs->name);
+			pr_warn("                      '%s' wd_nsec: %lld wd_now: %llx wd_last: %llx mask: %llx\n",
+				watchdog->name, wd_nsec, wdnow, wdlast, watchdog->mask);
+			pr_warn("                      '%s' cs_nsec: %lld cs_now: %llx cs_last: %llx mask: %llx\n",
+				cs->name, cs_nsec, csnow, cslast, cs->mask);
+			cs_wd_msec = div_s64_rem(cs_nsec - wd_nsec, 1000 * 1000, &wd_rem);
+			wd_msec = div_s64_rem(wd_nsec, 1000 * 1000, &wd_rem);
+			pr_warn("                      Clocksource '%s' skewed %lld ns (%lld ms) over watchdog '%s' interval of %lld ns (%lld ms)\n",
+				cs->name, cs_nsec - wd_nsec, cs_wd_msec, watchdog->name, wd_nsec, wd_msec);
+			if (curr_clocksource == cs)
+				pr_warn("                      '%s' is current clocksource.\n", cs->name);
+			else if (curr_clocksource)
+				pr_warn("                      '%s' (not '%s') is current clocksource.\n", curr_clocksource->name, cs->name);
+			else
+				pr_warn("                      No current clocksource.\n");
+			__clocksource_unstable(cs);
+			continue;
+		}
+
+		if (cs == curr_clocksource && cs->tick_stable)
+			cs->tick_stable(cs);
+
+		if (!(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES) &&
+		    (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS) &&
+		    (watchdog->flags & CLOCK_SOURCE_IS_CONTINUOUS)) {
+			/* Mark it valid for high-res. */
+			cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
+
+			/*
+			 * clocksource_done_booting() will sort it if
+			 * finished_booting is not set yet.
+			 */
+			if (!finished_booting)
+				continue;
+
+			/*
+			 * If this is not the current clocksource let
+			 * the watchdog thread reselect it. Due to the
+			 * change to high res this clocksource might
+			 * be preferred now. If it is the current
+			 * clocksource let the tick code know about
+			 * that change.
+			 */
+			if (cs != curr_clocksource) {
+				cs->flags |= CLOCK_SOURCE_RESELECT;
+				schedule_work(&watchdog_work);
+			} else {
+				tick_clock_notify();
+			}
+		}
+	}
+
+	/*
+	 * We only clear the watchdog_reset_pending, when we did a
+	 * full cycle through all clocksources.
+	 */
+	if (reset_pending)
+		atomic_dec(&watchdog_reset_pending);
+
+	/*
+	 * Cycle through CPUs to check if the CPUs stay synchronized
+	 * to each other.
+	 */
+	next_cpu = cpumask_next_wrap(raw_smp_processor_id(), cpu_online_mask);
+
+	/*
+	 * Arm timer if not already pending: could race with concurrent
+	 * pair clocksource_stop_watchdog() clocksource_start_watchdog().
+	 */
+	if (!timer_pending(&watchdog_timer)) {
+		watchdog_timer.expires += WATCHDOG_INTERVAL + extra_wait;
+		add_timer_on(&watchdog_timer, next_cpu);
+	}
+out:
+	spin_unlock(&watchdog_lock);
+}
+
+static inline void clocksource_start_watchdog(void)
+{
+	if (watchdog_running || !watchdog || list_empty(&watchdog_list))
+		return;
+	timer_setup(&watchdog_timer, clocksource_watchdog, 0);
+	watchdog_timer.expires = jiffies + WATCHDOG_INTERVAL;
+	add_timer_on(&watchdog_timer, cpumask_first(cpu_online_mask));
+	watchdog_running = 1;
+}
+
+static inline void clocksource_stop_watchdog(void)
+{
+	if (!watchdog_running || (watchdog && !list_empty(&watchdog_list)))
+		return;
+	timer_delete(&watchdog_timer);
+	watchdog_running = 0;
+}
+
+static void clocksource_resume_watchdog(void)
+{
+	atomic_inc(&watchdog_reset_pending);
+}
+
+static void clocksource_enqueue_watchdog(struct clocksource *cs)
+{
+	INIT_LIST_HEAD(&cs->wd_list);
+
+	if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+		/* cs is a clocksource to be watched. */
+		list_add(&cs->wd_list, &watchdog_list);
+		cs->flags &= ~CLOCK_SOURCE_WATCHDOG;
+	} else {
+		/* cs is a watchdog. */
+		if (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS)
+			cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
+	}
+}
+
+static void clocksource_select_watchdog(bool fallback)
+{
+	struct clocksource *cs, *old_wd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&watchdog_lock, flags);
+	/* save current watchdog */
+	old_wd = watchdog;
+	if (fallback)
+		watchdog = NULL;
+
+	list_for_each_entry(cs, &clocksource_list, list) {
+		/* cs is a clocksource to be watched. */
+		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY)
+			continue;
+
+		/* Skip current if we were requested for a fallback. */
+		if (fallback && cs == old_wd)
+			continue;
+
+		/* Pick the best watchdog. */
+		if (!watchdog || cs->rating > watchdog->rating)
+			watchdog = cs;
+	}
+	/* If we failed to find a fallback restore the old one. */
+	if (!watchdog)
+		watchdog = old_wd;
+
+	/* If we changed the watchdog we need to reset cycles. */
+	if (watchdog != old_wd)
+		clocksource_reset_watchdog();
+
+	/* Check if the watchdog timer needs to be started. */
+	clocksource_start_watchdog();
+	spin_unlock_irqrestore(&watchdog_lock, flags);
+}
+
+static void clocksource_dequeue_watchdog(struct clocksource *cs)
+{
+	if (cs != watchdog) {
+		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+			/* cs is a watched clocksource. */
+			list_del_init(&cs->wd_list);
+			/* Check if the watchdog timer needs to be stopped. */
+			clocksource_stop_watchdog();
+		}
+	}
+}
+
+static int __clocksource_watchdog_kthread(void)
+{
+	struct clocksource *cs, *tmp;
+	unsigned long flags;
+	int select = 0;
+
+	/* Do any required per-CPU skew verification. */
+	if (curr_clocksource &&
+	    curr_clocksource->flags & CLOCK_SOURCE_UNSTABLE &&
+	    curr_clocksource->flags & CLOCK_SOURCE_VERIFY_PERCPU)
+		clocksource_verify_percpu(curr_clocksource);
+
+	spin_lock_irqsave(&watchdog_lock, flags);
+	list_for_each_entry_safe(cs, tmp, &watchdog_list, wd_list) {
+		if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
+			list_del_init(&cs->wd_list);
+			clocksource_change_rating(cs, 0);
+			select = 1;
+		}
+		if (cs->flags & CLOCK_SOURCE_RESELECT) {
+			cs->flags &= ~CLOCK_SOURCE_RESELECT;
+			select = 1;
+		}
+	}
+	/* Check if the watchdog timer needs to be stopped. */
+	clocksource_stop_watchdog();
+	spin_unlock_irqrestore(&watchdog_lock, flags);
+
+	return select;
+}
+
+static int clocksource_watchdog_kthread(void *data)
+{
+	mutex_lock(&clocksource_mutex);
+	if (__clocksource_watchdog_kthread())
+		clocksource_select();
+	mutex_unlock(&clocksource_mutex);
+	return 0;
+}
+
+static bool clocksource_is_watchdog(struct clocksource *cs)
+{
+	return cs == watchdog;
+}
+
+#else /* CONFIG_CLOCKSOURCE_WATCHDOG */
+
+static void clocksource_enqueue_watchdog(struct clocksource *cs)
+{
+	if (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS)
+		cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
+}
+
+static void clocksource_select_watchdog(bool fallback) { }
+static inline void clocksource_dequeue_watchdog(struct clocksource *cs) { }
+static inline void clocksource_resume_watchdog(void) { }
+static inline int __clocksource_watchdog_kthread(void) { return 0; }
+static bool clocksource_is_watchdog(struct clocksource *cs) { return false; }
+void clocksource_mark_unstable(struct clocksource *cs) { }
+
+static inline void clocksource_watchdog_lock(unsigned long *flags) { }
+static inline void clocksource_watchdog_unlock(unsigned long *flags) { }
+
+#endif /* CONFIG_CLOCKSOURCE_WATCHDOG */
+
+static bool clocksource_is_suspend(struct clocksource *cs)
+{
+	return cs == suspend_clocksource;
+}
+
+static void __clocksource_suspend_select(struct clocksource *cs)
+{
+	/*
+	 * Skip the clocksource which will be stopped in suspend state.
+	 */
+	if (!(cs->flags & CLOCK_SOURCE_SUSPEND_NONSTOP))
+		return;
+
+	/*
+	 * The nonstop clocksource can be selected as the suspend clocksource to
+	 * calculate the suspend time, so it should not supply suspend/resume
+	 * interfaces to suspend the nonstop clocksource when system suspends.
+	 */
+	if (cs->suspend || cs->resume) {
+		pr_warn("Nonstop clocksource %s should not supply suspend/resume interfaces\n",
+			cs->name);
+	}
+
+	/* Pick the best rating. */
+	if (!suspend_clocksource || cs->rating > suspend_clocksource->rating)
+		suspend_clocksource = cs;
+}
+
+/**
+ * clocksource_suspend_select - Select the best clocksource for suspend timing
+ * @fallback:	if select a fallback clocksource
+ */
+static void clocksource_suspend_select(bool fallback)
+{
+	struct clocksource *cs, *old_suspend;
+
+	old_suspend = suspend_clocksource;
+	if (fallback)
+		suspend_clocksource = NULL;
+
+	list_for_each_entry(cs, &clocksource_list, list) {
+		/* Skip current if we were requested for a fallback. */
+		if (fallback && cs == old_suspend)
+			continue;
+
+		__clocksource_suspend_select(cs);
+	}
+}
+
+/**
+ * clocksource_start_suspend_timing - Start measuring the suspend timing
+ * @cs:			current clocksource from timekeeping
+ * @start_cycles:	current cycles from timekeeping
+ *
+ * This function will save the start cycle values of suspend timer to calculate
+ * the suspend time when resuming system.
+ *
+ * This function is called late in the suspend process from timekeeping_suspend(),
+ * that means processes are frozen, non-boot cpus and interrupts are disabled
+ * now. It is therefore possible to start the suspend timer without taking the
+ * clocksource mutex.
+ */
+void clocksource_start_suspend_timing(struct clocksource *cs, u64 start_cycles)
+{
+	if (!suspend_clocksource)
+		return;
+
+	/*
+	 * If current clocksource is the suspend timer, we should use the
+	 * tkr_mono.cycle_last value as suspend_start to avoid same reading
+	 * from suspend timer.
+	 */
+	if (clocksource_is_suspend(cs)) {
+		suspend_start = start_cycles;
+		return;
+	}
+
+	if (suspend_clocksource->enable &&
+	    suspend_clocksource->enable(suspend_clocksource)) {
+		pr_warn_once("Failed to enable the non-suspend-able clocksource.\n");
+		return;
+	}
+
+	suspend_start = suspend_clocksource->read(suspend_clocksource);
+}
+
+/**
+ * clocksource_stop_suspend_timing - Stop measuring the suspend timing
+ * @cs:		current clocksource from timekeeping
+ * @cycle_now:	current cycles from timekeeping
+ *
+ * This function will calculate the suspend time from suspend timer.
+ *
+ * Returns nanoseconds since suspend started, 0 if no usable suspend clocksource.
+ *
+ * This function is called early in the resume process from timekeeping_resume(),
+ * that means there is only one cpu, no processes are running and the interrupts
+ * are disabled. It is therefore possible to stop the suspend timer without
+ * taking the clocksource mutex.
+ */
+u64 clocksource_stop_suspend_timing(struct clocksource *cs, u64 cycle_now)
+{
+	u64 now, nsec = 0;
+
+	if (!suspend_clocksource)
+		return 0;
+
+	/*
+	 * If current clocksource is the suspend timer, we should use the
+	 * tkr_mono.cycle_last value from timekeeping as current cycle to
+	 * avoid same reading from suspend timer.
+	 */
+	if (clocksource_is_suspend(cs))
+		now = cycle_now;
+	else
+		now = suspend_clocksource->read(suspend_clocksource);
+
+	if (now > suspend_start)
+		nsec = cycles_to_nsec_safe(suspend_clocksource, suspend_start, now);
+
+	/*
+	 * Disable the suspend timer to save power if current clocksource is
+	 * not the suspend timer.
+	 */
+	if (!clocksource_is_suspend(cs) && suspend_clocksource->disable)
+		suspend_clocksource->disable(suspend_clocksource);
+
+	return nsec;
+}
+
+/**
+ * clocksource_suspend - suspend the clocksource(s)
+ */
+void clocksource_suspend(void)
+{
+	struct clocksource *cs;
+
+	list_for_each_entry_reverse(cs, &clocksource_list, list)
+		if (cs->suspend)
+			cs->suspend(cs);
+}
+
+/**
+ * clocksource_resume - resume the clocksource(s)
+ */
+void clocksource_resume(void)
+{
+	struct clocksource *cs;
+
+	list_for_each_entry(cs, &clocksource_list, list)
+		if (cs->resume)
+			cs->resume(cs);
+
+	clocksource_resume_watchdog();
+}
+
+/**
+ * clocksource_touch_watchdog - Update watchdog
+ *
+ * Update the watchdog after exception contexts such as kgdb so as not
+ * to incorrectly trip the watchdog. This might fail when the kernel
+ * was stopped in code which holds watchdog_lock.
+ */
+void clocksource_touch_watchdog(void)
+{
+	clocksource_resume_watchdog();
+}
+
+/**
+ * clocksource_max_adjustment- Returns max adjustment amount
+ * @cs:         Pointer to clocksource
+ *
+ */
+static u32 clocksource_max_adjustment(struct clocksource *cs)
+{
+	u64 ret;
+	/*
+	 * We won't try to correct for more than 11% adjustments (110,000 ppm),
+	 */
+	ret = (u64)cs->mult * 11;
+	do_div(ret,100);
+	return (u32)ret;
+}
+
+/**
+ * clocks_calc_max_nsecs - Returns maximum nanoseconds that can be converted
+ * @mult:	cycle to nanosecond multiplier
+ * @shift:	cycle to nanosecond divisor (power of two)
+ * @maxadj:	maximum adjustment value to mult (~11%)
+ * @mask:	bitmask for two's complement subtraction of non 64 bit counters
+ * @max_cyc:	maximum cycle value before potential overflow (does not include
+ *		any safety margin)
+ *
+ * NOTE: This function includes a safety margin of 50%, in other words, we
+ * return half the number of nanoseconds the hardware counter can technically
+ * cover. This is done so that we can potentially detect problems caused by
+ * delayed timers or bad hardware, which might result in time intervals that
+ * are larger than what the math used can handle without overflows.
+ */
+u64 clocks_calc_max_nsecs(u32 mult, u32 shift, u32 maxadj, u64 mask, u64 *max_cyc)
+{
+	u64 max_nsecs, max_cycles;
+
+	/*
+	 * Calculate the maximum number of cycles that we can pass to the
+	 * cyc2ns() function without overflowing a 64-bit result.
+	 */
+	max_cycles = ULLONG_MAX;
+	do_div(max_cycles, mult+maxadj);
+
+	/*
+	 * The actual maximum number of cycles we can defer the clocksource is
+	 * determined by the minimum of max_cycles and mask.
+	 * Note: Here we subtract the maxadj to make sure we don't sleep for
+	 * too long if there's a large negative adjustment.
+	 */
+	max_cycles = min(max_cycles, mask);
+	max_nsecs = clocksource_cyc2ns(max_cycles, mult - maxadj, shift);
+
+	/* return the max_cycles value as well if requested */
+	if (max_cyc)
+		*max_cyc = max_cycles;
+
+	/* Return 50% of the actual maximum, so we can detect bad values */
+	max_nsecs >>= 1;
+
+	return max_nsecs;
+}
+
+/**
+ * clocksource_update_max_deferment - Updates the clocksource max_idle_ns & max_cycles
+ * @cs:         Pointer to clocksource to be updated
+ *
+ */
+static inline void clocksource_update_max_deferment(struct clocksource *cs)
+{
+	cs->max_idle_ns = clocks_calc_max_nsecs(cs->mult, cs->shift,
+						cs->maxadj, cs->mask,
+						&cs->max_cycles);
+
+	/*
+	 * Threshold for detecting negative motion in clocksource_delta().
+	 *
+	 * Allow for 0.875 of the counter width so that overly long idle
+	 * sleeps, which go slightly over mask/2, do not trigger the
+	 * negative motion detection.
+	 */
+	cs->max_raw_delta = (cs->mask >> 1) + (cs->mask >> 2) + (cs->mask >> 3);
+}
+
+static struct clocksource *clocksource_find_best(bool oneshot, bool skipcur)
+{
+	struct clocksource *cs;
+
+	if (!finished_booting || list_empty(&clocksource_list))
+		return NULL;
+
+	/*
+	 * We pick the clocksource with the highest rating. If oneshot
+	 * mode is active, we pick the highres valid clocksource with
+	 * the best rating.
+	 */
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
+		if (oneshot && !(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES))
+			continue;
+		return cs;
+	}
+	return NULL;
+}
+
+static void __clocksource_select(bool skipcur)
+{
+	bool oneshot = tick_oneshot_mode_active();
+	struct clocksource *best, *cs;
+
+	/* Find the best suitable clocksource */
+	best = clocksource_find_best(oneshot, skipcur);
+	if (!best)
+		return;
+
+	if (!strlen(override_name))
+		goto found;
+
+	/* Check for the override clocksource. */
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
+		if (strcmp(cs->name, override_name) != 0)
+			continue;
+		/*
+		 * Check to make sure we don't switch to a non-highres
+		 * capable clocksource if the tick code is in oneshot
+		 * mode (highres or nohz)
+		 */
+		if (!(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES) && oneshot) {
+			/* Override clocksource cannot be used. */
+			if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
+				pr_warn("Override clocksource %s is unstable and not HRT compatible - cannot switch while in HRT/NOHZ mode\n",
+					cs->name);
+				override_name[0] = 0;
+			} else {
+				/*
+				 * The override cannot be currently verified.
+				 * Deferring to let the watchdog check.
+				 */
+				pr_info("Override clocksource %s is not currently HRT compatible - deferring\n",
+					cs->name);
+			}
+		} else
+			/* Override clocksource can be used. */
+			best = cs;
+		break;
+	}
+
+found:
+	if (curr_clocksource != best && !timekeeping_notify(best)) {
+		pr_info("Switched to clocksource %s\n", best->name);
+		curr_clocksource = best;
+	}
+}
+
+/**
+ * clocksource_select - Select the best clocksource available
+ *
+ * Private function. Must hold clocksource_mutex when called.
+ *
+ * Select the clocksource with the best rating, or the clocksource,
+ * which is selected by userspace override.
+ */
+static void clocksource_select(void)
+{
+	__clocksource_select(false);
+}
+
+static void clocksource_select_fallback(void)
+{
+	__clocksource_select(true);
+}
+
+/*
+ * clocksource_done_booting - Called near the end of core bootup
+ *
+ * Hack to avoid lots of clocksource churn at boot time.
+ * We use fs_initcall because we want this to start before
+ * device_initcall but after subsys_initcall.
+ */
+static int __init clocksource_done_booting(void)
+{
+	mutex_lock(&clocksource_mutex);
+	curr_clocksource = clocksource_default_clock();
+	finished_booting = 1;
+	/*
+	 * Run the watchdog first to eliminate unstable clock sources
+	 */
+	__clocksource_watchdog_kthread();
+	clocksource_select();
+	mutex_unlock(&clocksource_mutex);
+	return 0;
+}
+fs_initcall(clocksource_done_booting);
+
+/*
+ * Enqueue the clocksource sorted by rating
+ */
+static void clocksource_enqueue(struct clocksource *cs)
+{
+	struct list_head *entry = &clocksource_list;
+	struct clocksource *tmp;
+
+	list_for_each_entry(tmp, &clocksource_list, list) {
+		/* Keep track of the place, where to insert */
+		if (tmp->rating < cs->rating)
+			break;
+		entry = &tmp->list;
+	}
+	list_add(&cs->list, entry);
+}
+
+/**
+ * __clocksource_update_freq_scale - Used update clocksource with new freq
+ * @cs:		clocksource to be registered
+ * @scale:	Scale factor multiplied against freq to get clocksource hz
+ * @freq:	clocksource frequency (cycles per second) divided by scale
+ *
+ * This should only be called from the clocksource->enable() method.
+ *
+ * This *SHOULD NOT* be called directly! Please use the
+ * __clocksource_update_freq_hz() or __clocksource_update_freq_khz() helper
+ * functions.
+ */
+void __clocksource_update_freq_scale(struct clocksource *cs, u32 scale, u32 freq)
+{
+	u64 sec;
+
+	/*
+	 * Default clocksources are *special* and self-define their mult/shift.
+	 * But, you're not special, so you should specify a freq value.
+	 */
+	if (freq) {
+		/*
+		 * Calc the maximum number of seconds which we can run before
+		 * wrapping around. For clocksources which have a mask > 32-bit
+		 * we need to limit the max sleep time to have a good
+		 * conversion precision. 10 minutes is still a reasonable
+		 * amount. That results in a shift value of 24 for a
+		 * clocksource with mask >= 40-bit and f >= 4GHz. That maps to
+		 * ~ 0.06ppm granularity for NTP.
+		 */
+		sec = cs->mask;
+		do_div(sec, freq);
+		do_div(sec, scale);
+		if (!sec)
+			sec = 1;
+		else if (sec > 600 && cs->mask > UINT_MAX)
+			sec = 600;
+
+		clocks_calc_mult_shift(&cs->mult, &cs->shift, freq,
+				       NSEC_PER_SEC / scale, sec * scale);
+	}
+
+	/*
+	 * If the uncertainty margin is not specified, calculate it.  If
+	 * both scale and freq are non-zero, calculate the clock period, but
+	 * bound below at 2*WATCHDOG_MAX_SKEW, that is, 500ppm by default.
+	 * However, if either of scale or freq is zero, be very conservative
+	 * and take the tens-of-milliseconds WATCHDOG_THRESHOLD value
+	 * for the uncertainty margin.  Allow stupidly small uncertainty
+	 * margins to be specified by the caller for testing purposes,
+	 * but warn to discourage production use of this capability.
+	 *
+	 * Bottom line:  The sum of the uncertainty margins of the
+	 * watchdog clocksource and the clocksource under test will be at
+	 * least 500ppm by default.  For more information, please see the
+	 * comment preceding CONFIG_CLOCKSOURCE_WATCHDOG_MAX_SKEW_US above.
+	 */
+	if (scale && freq && !cs->uncertainty_margin) {
+		cs->uncertainty_margin = NSEC_PER_SEC / (scale * freq);
+		if (cs->uncertainty_margin < 2 * WATCHDOG_MAX_SKEW)
+			cs->uncertainty_margin = 2 * WATCHDOG_MAX_SKEW;
+	} else if (!cs->uncertainty_margin) {
+		cs->uncertainty_margin = WATCHDOG_THRESHOLD;
+	}
+	WARN_ON_ONCE(cs->uncertainty_margin < 2 * WATCHDOG_MAX_SKEW);
+
+	/*
+	 * Ensure clocksources that have large 'mult' values don't overflow
+	 * when adjusted.
+	 */
+	cs->maxadj = clocksource_max_adjustment(cs);
+	while (freq && ((cs->mult + cs->maxadj < cs->mult)
+		|| (cs->mult - cs->maxadj > cs->mult))) {
+		cs->mult >>= 1;
+		cs->shift--;
+		cs->maxadj = clocksource_max_adjustment(cs);
+	}
+
+	/*
+	 * Only warn for *special* clocksources that self-define
+	 * their mult/shift values and don't specify a freq.
+	 */
+	WARN_ONCE(cs->mult + cs->maxadj < cs->mult,
+		"timekeeping: Clocksource %s might overflow on 11%% adjustment\n",
+		cs->name);
+
+	clocksource_update_max_deferment(cs);
+
+	pr_info("%s: mask: 0x%llx max_cycles: 0x%llx, max_idle_ns: %lld ns\n",
+		cs->name, cs->mask, cs->max_cycles, cs->max_idle_ns);
+}
+EXPORT_SYMBOL_GPL(__clocksource_update_freq_scale);
+
+/**
+ * __clocksource_register_scale - Used to install new clocksources
+ * @cs:		clocksource to be registered
+ * @scale:	Scale factor multiplied against freq to get clocksource hz
+ * @freq:	clocksource frequency (cycles per second) divided by scale
+ *
+ * Returns -EBUSY if registration fails, zero otherwise.
+ *
+ * This *SHOULD NOT* be called directly! Please use the
+ * clocksource_register_hz() or clocksource_register_khz helper functions.
+ */
+int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
+{
+	unsigned long flags;
+
+	clocksource_arch_init(cs);
+
+	if (WARN_ON_ONCE((unsigned int)cs->id >= CSID_MAX))
+		cs->id = CSID_GENERIC;
+	if (cs->vdso_clock_mode < 0 ||
+	    cs->vdso_clock_mode >= VDSO_CLOCKMODE_MAX) {
+		pr_warn("clocksource %s registered with invalid VDSO mode %d. Disabling VDSO support.\n",
+			cs->name, cs->vdso_clock_mode);
+		cs->vdso_clock_mode = VDSO_CLOCKMODE_NONE;
+	}
+
+	/* Initialize mult/shift and max_idle_ns */
+	__clocksource_update_freq_scale(cs, scale, freq);
+
+	/* Add clocksource to the clocksource list */
+	mutex_lock(&clocksource_mutex);
+
+	clocksource_watchdog_lock(&flags);
+	clocksource_enqueue(cs);
+	clocksource_enqueue_watchdog(cs);
+	clocksource_watchdog_unlock(&flags);
+
+	clocksource_select();
+	clocksource_select_watchdog(false);
+	__clocksource_suspend_select(cs);
+	mutex_unlock(&clocksource_mutex);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(__clocksource_register_scale);
+
+/*
+ * Unbind clocksource @cs. Called with clocksource_mutex held
+ */
+static int clocksource_unbind(struct clocksource *cs)
+{
+	unsigned long flags;
+
+	if (clocksource_is_watchdog(cs)) {
+		/* Select and try to install a replacement watchdog. */
+		clocksource_select_watchdog(true);
+		if (clocksource_is_watchdog(cs))
+			return -EBUSY;
+	}
+
+	if (cs == curr_clocksource) {
+		/* Select and try to install a replacement clock source */
+		clocksource_select_fallback();
+		if (curr_clocksource == cs)
+			return -EBUSY;
+	}
+
+	if (clocksource_is_suspend(cs)) {
+		/*
+		 * Select and try to install a replacement suspend clocksource.
+		 * If no replacement suspend clocksource, we will just let the
+		 * clocksource go and have no suspend clocksource.
+		 */
+		clocksource_suspend_select(true);
+	}
+
+	clocksource_watchdog_lock(&flags);
+	clocksource_dequeue_watchdog(cs);
+	list_del_init(&cs->list);
+	clocksource_watchdog_unlock(&flags);
+
+	return 0;
+}
+
+/**
+ * clocksource_unregister - remove a registered clocksource
+ * @cs:	clocksource to be unregistered
+ */
+int clocksource_unregister(struct clocksource *cs)
+{
+	int ret = 0;
+
+	mutex_lock(&clocksource_mutex);
+	if (!list_empty(&cs->list))
+		ret = clocksource_unbind(cs);
+	mutex_unlock(&clocksource_mutex);
+	return ret;
+}
+EXPORT_SYMBOL(clocksource_unregister);
+
+#ifdef CONFIG_SYSFS
+/**
+ * current_clocksource_show - sysfs interface for current clocksource
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	char buffer to be filled with clocksource list
+ *
+ * Provides sysfs interface for listing current clocksource.
+ */
+static ssize_t current_clocksource_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	ssize_t count = 0;
+
+	mutex_lock(&clocksource_mutex);
+	count = sysfs_emit(buf, "%s\n", curr_clocksource->name);
+	mutex_unlock(&clocksource_mutex);
+
+	return count;
+}
+
+ssize_t sysfs_get_uname(const char *buf, char *dst, size_t cnt)
+{
+	size_t ret = cnt;
+
+	/* strings from sysfs write are not 0 terminated! */
+	if (!cnt || cnt >= CS_NAME_LEN)
+		return -EINVAL;
+
+	/* strip of \n: */
+	if (buf[cnt-1] == '\n')
+		cnt--;
+	if (cnt > 0)
+		memcpy(dst, buf, cnt);
+	dst[cnt] = 0;
+	return ret;
+}
+
+/**
+ * current_clocksource_store - interface for manually overriding clocksource
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	name of override clocksource
+ * @count:	length of buffer
+ *
+ * Takes input from sysfs interface for manually overriding the default
+ * clocksource selection.
+ */
+static ssize_t current_clocksource_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	ssize_t ret;
+
+	mutex_lock(&clocksource_mutex);
+
+	ret = sysfs_get_uname(buf, override_name, count);
+	if (ret >= 0)
+		clocksource_select();
+
+	mutex_unlock(&clocksource_mutex);
+
+	return ret;
+}
+static DEVICE_ATTR_RW(current_clocksource);
+
+/**
+ * unbind_clocksource_store - interface for manually unbinding clocksource
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	unused
+ * @count:	length of buffer
+ *
+ * Takes input from sysfs interface for manually unbinding a clocksource.
+ */
+static ssize_t unbind_clocksource_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct clocksource *cs;
+	char name[CS_NAME_LEN];
+	ssize_t ret;
+
+	ret = sysfs_get_uname(buf, name, count);
+	if (ret < 0)
+		return ret;
+
+	ret = -ENODEV;
+	mutex_lock(&clocksource_mutex);
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (strcmp(cs->name, name))
+			continue;
+		ret = clocksource_unbind(cs);
+		break;
+	}
+	mutex_unlock(&clocksource_mutex);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(unbind_clocksource);
+
+/**
+ * available_clocksource_show - sysfs interface for listing clocksource
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	char buffer to be filled with clocksource list
+ *
+ * Provides sysfs interface for listing registered clocksources
+ */
+static ssize_t available_clocksource_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct clocksource *src;
+	ssize_t count = 0;
+
+	mutex_lock(&clocksource_mutex);
+	list_for_each_entry(src, &clocksource_list, list) {
+		/*
+		 * Don't show non-HRES clocksource if the tick code is
+		 * in one shot mode (highres=on or nohz=on)
+		 */
+		if (!tick_oneshot_mode_active() ||
+		    (src->flags & CLOCK_SOURCE_VALID_FOR_HRES))
+			count += snprintf(buf + count,
+				  max((ssize_t)PAGE_SIZE - count, (ssize_t)0),
+				  "%s ", src->name);
+	}
+	mutex_unlock(&clocksource_mutex);
+
+	count += snprintf(buf + count,
+			  max((ssize_t)PAGE_SIZE - count, (ssize_t)0), "\n");
+
+	return count;
+}
+static DEVICE_ATTR_RO(available_clocksource);
+
+static struct attribute *clocksource_attrs[] = {
+	&dev_attr_current_clocksource.attr,
+	&dev_attr_unbind_clocksource.attr,
+	&dev_attr_available_clocksource.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(clocksource);
+
+static const struct bus_type clocksource_subsys = {
+	.name = "clocksource",
+	.dev_name = "clocksource",
+};
+
+static struct device device_clocksource = {
+	.id	= 0,
+	.bus	= &clocksource_subsys,
+	.groups	= clocksource_groups,
+};
+
+static int __init init_clocksource_sysfs(void)
+{
+	int error = subsys_system_register(&clocksource_subsys, NULL);
+
+	if (!error)
+		error = device_register(&device_clocksource);
+
+	return error;
+}
+
+device_initcall(init_clocksource_sysfs);
+#endif /* CONFIG_SYSFS */
+
+/**
+ * boot_override_clocksource - boot clock override
+ * @str:	override name
+ *
+ * Takes a clocksource= boot argument and uses it
+ * as the clocksource override name.
+ */
+static int __init boot_override_clocksource(char* str)
+{
+	mutex_lock(&clocksource_mutex);
+	if (str)
+		strscpy(override_name, str);
+	mutex_unlock(&clocksource_mutex);
+	return 1;
+}
+
+__setup("clocksource=", boot_override_clocksource);
+
+/**
+ * boot_override_clock - Compatibility layer for deprecated boot option
+ * @str:	override name
+ *
+ * DEPRECATED! Takes a clock= boot argument and uses it
+ * as the clocksource override name
+ */
+static int __init boot_override_clock(char* str)
+{
+	if (!strcmp(str, "pmtmr")) {
+		pr_warn("clock=pmtmr is deprecated - use clocksource=acpi_pm\n");
+		return boot_override_clocksource("acpi_pm");
+	}
+	pr_warn("clock= boot option is deprecated - use clocksource=xyz\n");
+	return boot_override_clocksource(str);
+}
+
+__setup("clock=", boot_override_clock);
