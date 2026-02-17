@@ -59,6 +59,10 @@
 #include <kern/exc_resource.h>
 #include <kern/host.h>
 #include <kern/ledger.h>
+#include <os/atomic.h>
+#include <os/atomic_private.h>
+#include <kern/cpc.h>
+#include <arm64/cpc_arm64.h>
 #include <kern/mach_param.h> /* for TASK_CHUNK */
 #include <kern/monotonic.h>
 #include <kern/policy_internal.h>
@@ -78161,3 +78165,86 @@ task_get_effective_jetsam_coalition_policy(task_t task, int flavor)
 
 	return false;
 }
+
+#pragma mark - Ownership
+
+#if CONFIG_CPU_COUNTERS
+static const char * _Atomic _cpc_hw_owners[CPC_HW_COUNT] = { NULL };
+#endif // CONFIG_CPU_COUNTERS
+
+__result_use_check bool
+cpc_hw_acquire(cpc_hw_t hw, const char *owner_name)
+{
+#if CONFIG_CPU_COUNTERS
+	assert3u(hw, <, CPC_HW_COUNT);
+	extern int kpc_get_force_all_ctrs(void);
+	if (hw == CPC_HW_CPMU && kpc_get_force_all_ctrs()) {
+		return false;
+	}
+	return os_atomic_cmpxchg(&_cpc_hw_owners[hw], NULL, owner_name, acq_rel);
+#else // CONFIG_CPU_COUNTERS
+#pragma unused(hw, owner_name)
+	return false;
+#endif // !CONFIG_CPU_COUNTERS
+}
+
+bool
+cpc_hw_in_use(cpc_hw_t hw)
+{
+#if CONFIG_CPU_COUNTERS
+	assert3u(hw, <, CPC_HW_COUNT);
+	return os_atomic_load(&_cpc_hw_owners[hw], acquire) != NULL;
+#else // CONFIG_CPU_COUNTERS
+#pragma unused(hw)
+	return false;
+#endif // !CONFIG_CPU_COUNTERS
+}
+
+void
+cpc_hw_release(cpc_hw_t hw, const char *owner_name)
+{
+#if CONFIG_CPU_COUNTERS
+	assert3u(hw, <, CPC_HW_COUNT);
+	if (!os_atomic_cmpxchg(&_cpc_hw_owners[hw], owner_name, NULL, acq_rel)) {
+		panic("CPC: unpaired HW release: %s on %u", owner_name, hw);
+	}
+#else // CONFIG_CPU_COUNTERS
+#pragma unused(hw, owner_name)
+#endif // !CONFIG_CPU_COUNTERS
+}
+
+bool
+cpc_is_secure(void)
+{
+#if CONFIG_CPU_COUNTERS
+#if __arm64__
+	cpc_event_policy_t policy = cpc_get_event_policy();
+	return policy == CPC_EVPOL_RESTRICT_TO_KNOWN || policy == CPC_EVPOL_DENY_ALL;
+#else // __arm64__
+	return false;
+#endif // !__arm64__
+#else // CONFIG_CPU_COUNTERS
+	return true;
+#endif // !CONFIG_CPU_COUNTERS
+}
+
+#if CPC_INSECURE
+
+void
+cpc_change_security(bool enforce_security)
+{
+#if CONFIG_CPU_COUNTERS
+#if __arm64__
+	cpc_set_event_policy(enforce_security ? CPC_EVPOL_RESTRICT_TO_KNOWN : CPC_EVPOL_DEFAULT);
+	extern bool kpc_allows_counting_system;
+	kpc_allows_counting_system = !enforce_security;
+#else // __arm64__
+#pragma unused(enforce_security)
+	// Intel has no event policy or other security features.
+#endif // !__arm64__
+#else // CONFIG_CPU_COUNTERS
+#pragma unused(enforce_security)
+#endif // !CONFIG_CPU_COUNTERS
+}
+
+#endif // CPC_INSECURE
