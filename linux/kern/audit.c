@@ -1,4 +1,4 @@
-/* SPDX License Indentifier: GPL-3.0 */
+/* SPDX License Indentifier: GPL-2.0 */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
